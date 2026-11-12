@@ -6,12 +6,12 @@ from bs4 import BeautifulSoup
 # Nhận tham số truyền vào từ GitHub Actions
 link = sys.argv[1]
 code = sys.argv[2]
-request_id = sys.argv[3] # ID định danh cho lần request này để lưu lên Firebase
+request_id = sys.argv[3]
 
 # Trích xuất username từ link
 username = link.rstrip('/').split('/')[-1]
 
-# Cấu hình Firebase Realtime Database của ông (thay URL của ông vào đây)
+# Cấu hình Firebase Realtime Database
 FIREBASE_URL = "https://PROJECT_ID-default-rtdb.firebaseio.com/verifications/" + request_id + ".json"
 
 def update_firebase(data):
@@ -20,7 +20,6 @@ def update_firebase(data):
     except Exception as e:
         print("Lỗi ghi Firebase:", e)
 
-# Gửi request cào Lazi (IP của GitHub nên không sợ Cloudflare chặn)
 verify_post_url = 'https://lazi.vn/p/d/926260'
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -49,7 +48,6 @@ try:
         update_firebase({"status": "error", "message": "Không tìm thấy bình luận chứa mã xác thực từ tài khoản của bạn!"})
         sys.exit(0)
         
-    # Cào tiếp trang cá nhân lấy tên và avatar
     profile_url = f"https://lazi.vn/user/{username}"
     prof_res = requests.get(profile_url, headers=headers, timeout=10)
     prof_soup = BeautifulSoup(prof_res.text, 'html.parser')
@@ -65,7 +63,6 @@ try:
     else:
         avatar = 'https://cdn.lazi.vn/system/cms/themes/mytheme/images/default_avatar.png'
         
-    # Thành công -> Đẩy data lên Firebase
     result_data = {
         "status": "success",
         "message": "Xác thực thành công!",
@@ -74,4 +71,7 @@ try:
         "profile_link": profile_url,
         "username": username
     }
-    update
+    update_firebase(result_data)
+
+except Exception as e:
+    update_firebase({"status": "error", "message": "Lỗi hệ thống: " + str(e)})
