@@ -1,0 +1,25 @@
+name: Lazi Verify Worker
+
+on:
+  repository_dispatch:
+    types: [verify_request]
+
+jobs:
+  run-checker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4
+
+      - name: Run Python Script
+        run: |
+          python checker.py "${{ github.event.client_payload.link }}" "${{ github.event.client_payload.code }}" "${{ github.event.client_payload.request_id }}"
