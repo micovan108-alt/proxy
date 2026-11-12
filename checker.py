@@ -16,7 +16,6 @@ FIREBASE_URL = f"https://vex-e3600-default-rtdb.asia-southeast1.firebasedatabase
 
 def update_firebase(data):
     try:
-        # Sử dụng cloudscraper để PUT dữ liệu lên Firebase luôn cho đồng bộ
         response = cloudscraper.create_scraper().put(FIREBASE_URL, json=data)
         print("Firebase response:", response.status_code, response.text)
     except Exception as e:
@@ -47,7 +46,7 @@ cookie_string = (
     "lzc_first_visit=1"
 )
 
-# Khởi tạo cloudscraper chuyên dụng vượt Cloudflare 403
+# Khởi tạo cloudscraper chuyên dụng vượt Cloudflare
 scraper = cloudscraper.create_scraper()
 scraper.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
