@@ -1,22 +1,22 @@
 import sys
-import os
 import requests
 from bs4 import BeautifulSoup
 
-# Nhận tham số truyền vào từ GitHub Actions
-link = sys.argv[1]
-code = sys.argv[2]
-request_id = sys.argv[3]
+# Nhận tham số truyền vào từ GitHub Actions hoặc dòng lệnh
+link = sys.argv[1] if len(sys.argv) > 1 else "https://lazi.vn/user/tien-nam.nguyen20"
+code = sys.argv[2] if len(sys.argv) > 2 else "TEST"
+request_id = sys.argv[3] if len(sys.argv) > 3 else "req_test"
 
-# Trích xuất username từ link
+# Trích xuất username từ link Lazi
 username = link.rstrip('/').split('/')[-1]
 
-# Cấu hình Firebase Realtime Database
-FIREBASE_URL = "https://PROJECT_ID-default-rtdb.firebaseio.com/verifications/" + request_id + ".json"
+# URL Firebase Realtime Database (được cấu hình chuẩn theo project vex-e3600)
+FIREBASE_URL = f"https://vex-e3600-default-rtdb.asia-southeast1.firebasedatabase.app/verifications/{request_id}.json"
 
 def update_firebase(data):
     try:
-        requests.put(FIREBASE_URL, json=data)
+        response = requests.put(FIREBASE_URL, json=data)
+        print("Firebase response:", response.status_code, response.text)
     except Exception as e:
         print("Lỗi ghi Firebase:", e)
 
@@ -29,7 +29,7 @@ headers = {
 try:
     response = requests.get(verify_post_url, headers=headers, timeout=10)
     if response.status_code != 200:
-        update_firebase({"status": "error", "message": "Lazi từ chối kết nối (Mã lỗi: " + str(response.status_code) + ")"})
+        update_firebase({"status": "error", "message": f"Lazi từ chối kết nối (Mã lỗi: {response.status_code})"})
         sys.exit(1)
         
     soup = BeautifulSoup(response.text, 'html.parser')
