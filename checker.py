@@ -1,6 +1,6 @@
 import sys
 import os
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 
 # Nhận tham số truyền vào từ GitHub Actions
@@ -16,7 +16,8 @@ FIREBASE_URL = f"https://vex-e3600-default-rtdb.asia-southeast1.firebasedatabase
 
 def update_firebase(data):
     try:
-        response = requests.put(FIREBASE_URL, json=data)
+        # Sử dụng cloudscraper để PUT dữ liệu lên Firebase luôn cho đồng bộ
+        response = cloudscraper.create_scraper().put(FIREBASE_URL, json=data)
         print("Firebase response:", response.status_code, response.text)
     except Exception as e:
         print("Lỗi ghi Firebase:", e)
@@ -46,8 +47,9 @@ cookie_string = (
     "lzc_first_visit=1"
 )
 
-verify_post_url = 'https://lazi.vn/p/d/926260'
-headers = {
+# Khởi tạo cloudscraper chuyên dụng vượt Cloudflare 403
+scraper = cloudscraper.create_scraper()
+scraper.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
@@ -61,10 +63,12 @@ headers = {
     'Sec-Fetch-Site': 'same-origin',
     'Sec-Fetch-User': '?1',
     'Upgrade-Insecure-Requests': '1'
-}
+})
+
+verify_post_url = 'https://lazi.vn/p/d/926260'
 
 try:
-    response = requests.get(verify_post_url, headers=headers, timeout=10)
+    response = scraper.get(verify_post_url, timeout=15)
     if response.status_code != 200:
         update_firebase({"status": "error", "message": "Lazi từ chối kết nối (Mã lỗi: " + str(response.status_code) + ")"})
         sys.exit(1)
@@ -87,7 +91,7 @@ try:
         
     # Cào tiếp trang cá nhân lấy tên và avatar
     profile_url = f"https://lazi.vn/user/{username}"
-    prof_res = requests.get(profile_url, headers=headers, timeout=10)
+    prof_res = scraper.get(profile_url, timeout=15)
     prof_soup = BeautifulSoup(prof_res.text, 'html.parser')
     
     name_node = prof_soup.select_one("h1.h1_bold")
