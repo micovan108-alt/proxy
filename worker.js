@@ -18,6 +18,90 @@ const RUN_NOTE = process.env.RUN_NOTE || "Treo câu cá tự động";
 const RUN_ID = process.env.GITHUB_RUN_ID || `local-${Date.now()}`;
 const END_TIME = Date.now() + MAX_HOURS * 3600 * 1000;
 
+// =========================================================================
+// BẢNG GIÁ CẦN CÂU & MỒI CÂU (CẤP 1 -> 6)
+// Mồi chuẩn: cam | tom | muc | ca_moi | ngoc (giun cấp 1 có sẵn miễn phí)
+// =========================================================================
+const ROD_PRICES = {
+  1: { name: "Cần trúc (Cấp 1)", price: 0, free: true },
+  2: { name: "Cần sợi thuỷ tinh (Cấp 2)", price: 500, free: false },
+  3: { name: "Cần carbon (Cấp 3)", price: 1000, free: false },
+  4: { name: "Cần hợp kim (Cấp 4)", price: 3000, free: false },
+  5: { name: "Cần biển sâu (Cấp 5)", price: 7000, free: false },
+  6: { name: "Cần huyền thoại (Cấp 6)", price: 10000, free: false }
+};
+
+const BAIT_BY_CODE = {
+  giun: { code: "giun", tier: 1, name: "Giun đất (Cấp 1)", price: 0, packSize: null, free: true },
+  cam: { code: "cam", tier: 2, name: "Mồi cám (Cấp 2)", price: 100, packSize: 20, free: false },
+  tom: { code: "tom", tier: 3, name: "Tôm tươi (Cấp 3)", price: 200, packSize: 20, free: false },
+  muc: { code: "muc", tier: 4, name: "Mực ống (Cấp 4)", price: 350, packSize: 20, free: false },
+  ca_moi: { code: "ca_moi", tier: 5, name: "Cá mồi sống (Cấp 5)", price: 600, packSize: 20, free: false },
+  ngoc: { code: "ngoc", tier: 6, name: "Ngọc trai mồi (Cấp 6)", price: 800, packSize: 10, free: false }
+};
+
+const BAIT_ALIAS_TO_CODE = {
+  "giun": "giun", "giun_dat": "giun", "1": "giun", "bait:1": "giun",
+  "cam": "cam", "moi_cam": "cam", "2": "cam", "bait:2": "cam",
+  "tom": "tom", "tom_tuoi": "tom", "3": "tom", "bait:3": "tom",
+  "muc": "muc", "muc_ong": "muc", "4": "muc", "bait:4": "muc",
+  "ca_moi": "ca_moi", "ca_moi_song": "ca_moi", "5": "ca_moi", "bait:5": "ca_moi",
+  "ngoc": "ngoc", "ngoc_trai": "ngoc", "ngoc_trai_moi": "ngoc", "6": "ngoc", "bait:6": "ngoc"
+};
+
+function parseRodTier(itemStr) {
+  const s = String(itemStr || "").trim().toLowerCase();
+  const m = s.match(/^(?:rod[:_]?|cap[:_]?|tier[:_]?)?([1-6])$/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+function normalizeBaitCode(itemStr) {
+  const s = String(itemStr || "").trim().toLowerCase();
+  if (!s) return null;
+  if (BAIT_ALIAS_TO_CODE[s]) return BAIT_ALIAS_TO_CODE[s];
+  const m = s.match(/^(?:bait[:_]?|cap[:_]?|tier[:_]?)?([1-6])$/);
+  if (m) {
+    const mapByNum = { 1: "giun", 2: "cam", 3: "tom", 4: "muc", 5: "ca_moi", 6: "ngoc" };
+    return mapByNum[parseInt(m[1], 10)] || null;
+  }
+  return s;
+}
+
+function resolvePurchaseTarget(itemStr, qty) {
+  const safeQty = Math.max(1, Math.min(999, parseInt(qty, 10) || 1));
+  const rodTier = parseRodTier(itemStr);
+  if (rodTier) {
+    const info = ROD_PRICES[rodTier];
+    return {
+      itemCode: `rod:${rodTier}`,
+      qty: safeQty,
+      cost: info.free ? 0 : info.price * safeQty,
+      free: info.free,
+      label: info.name
+    };
+  }
+
+  const baitCode = normalizeBaitCode(itemStr);
+  if (baitCode && BAIT_BY_CODE[baitCode]) {
+    const info = BAIT_BY_CODE[baitCode];
+    return {
+      itemCode: info.code,
+      qty: safeQty,
+      cost: info.free ? 0 : info.price * safeQty,
+      free: info.free,
+      label: info.name
+    };
+  }
+
+  return {
+    itemCode: String(itemStr).trim(),
+    qty: safeQty,
+    cost: null,
+    free: false,
+    label: String(itemStr).trim()
+  };
+}
+
 const FISH_DICT = {
   ro_dong: "Cá rô đồng",
   diec: "Cá diếc",
@@ -99,8 +183,25 @@ let ACTIVE_ACC = {
   uid: "",
   username: "",
   fullName: "",
-  rawCookie: ""
+  rawCookie: "",
+  coins: null
 };
+
+function extractCoinsFromPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  if (typeof payload.coins === "number") return payload.coins;
+  if (payload.state && typeof payload.state.coins === "number") return payload.state.coins;
+  if (payload.data && typeof payload.data.coins === "number") return payload.data.coins;
+  return null;
+}
+
+async function syncCoins(newCoins) {
+  if (typeof newCoins !== "number" || Number.isNaN(newCoins)) return;
+  ACTIVE_ACC.coins = newCoins;
+  if (ACTIVE_ACC.id && ACTIVE_ACC.id !== "default") {
+    await fbPatch(`worker_accounts/${ACTIVE_ACC.id}`, { coins: newCoins, coins_updated_at: Date.now() });
+  }
+}
 
 // =========================================================================
 // FIREBASE REALTIME DATABASE HELPERS
@@ -289,7 +390,8 @@ async function resolveTargetAccount() {
         uid: meta.uid || acc.uid || "",
         username: meta.username || acc.username || "",
         fullName: meta.fullName || acc.full_name || "",
-        rawCookie: acc.cookie
+        rawCookie: acc.cookie,
+        coins: typeof acc.coins === "number" ? acc.coins : null
       };
 
       await fbPatch(`worker_accounts/${targetId}`, {
@@ -315,7 +417,8 @@ async function resolveTargetAccount() {
       uid: meta.uid,
       username: meta.username,
       fullName: meta.fullName,
-      rawCookie: ENV_COOKIE
+      rawCookie: ENV_COOKIE,
+      coins: null
     };
     return cookies;
   }
@@ -574,16 +677,17 @@ async function rpc(name, body, token) {
 
 function normalizeAutomationConfig(rawCfg) {
   const cfg = rawCfg || {};
+  const rawBait = String(cfg.bait_item || "ngoc").trim();
   return {
     auto_buy_rod: Boolean(cfg.auto_buy_rod),
-    rod_item: String(cfg.rod_item || "rod:6").trim(),
+    rod_item: String(cfg.rod_item || "rod:2").trim(),
     rod_qty: Math.max(1, Math.min(999, parseInt(cfg.rod_qty, 10) || 1)),
-    rod_every: Math.max(0, parseInt(cfg.rod_every, 10) || 0), // 0 = chỉ mua khi bắt đầu hoặc khi thiếu cần
+    rod_every: Math.max(0, parseInt(cfg.rod_every, 10) || 0),
 
     auto_buy_bait: Boolean(cfg.auto_buy_bait),
-    bait_item: String(cfg.bait_item || "ngoc").trim(),
+    bait_item: normalizeBaitCode(rawBait) || "ngoc",
     bait_qty: Math.max(1, Math.min(999, parseInt(cfg.bait_qty, 10) || 1)),
-    bait_every: Math.max(0, parseInt(cfg.bait_every, 10) || 0), // >0: mua mồi định kỳ sau mỗi N lượt
+    bait_every: Math.max(0, parseInt(cfg.bait_every, 10) || 0),
 
     auto_sell: Boolean(cfg.auto_sell),
     sell_every: Math.max(1, parseInt(cfg.sell_every, 10) || 25),
@@ -608,19 +712,43 @@ async function getAutomationConfig() {
 
 async function buyItem(item, qty, tag) {
   if (!item) return { ok: false, raw: "Thiếu mã vật phẩm" };
+  const target = resolvePurchaseTarget(item, qty);
+
+  if (target.free) {
+    await pushLog("INFO", `[${tag}] ${target.label} (${target.itemCode}) có sẵn miễn phí, không cần mua.`);
+    return { ok: true, free: true };
+  }
+
+  if (target.cost !== null && typeof ACTIVE_ACC.coins === "number") {
+    if (ACTIVE_ACC.coins < target.cost) {
+      await pushLog(
+        "WARN",
+        `[${tag}] Không đủ coin mua ${target.label} (${target.itemCode}) x${target.qty} (Cần ${target.cost.toLocaleString("vi-VN")} coin, đang có ${ACTIVE_ACC.coins.toLocaleString("vi-VN")} coin)`
+      );
+      return { ok: false, skipped: "insufficient_coins" };
+    }
+  }
+
   let token = await getValidToken(false);
-  const safeQty = Math.max(1, Math.min(999, parseInt(qty, 10) || 1));
-  let res = await rpc("fishing_buy", { p_item: String(item), p_qty: safeQty }, token);
+  let res = await rpc("fishing_buy", { p_item: target.itemCode, p_qty: target.qty }, token);
 
   if (res.status === 401 || res.status === 403) {
     token = await getValidToken(true);
-    res = await rpc("fishing_buy", { p_item: String(item), p_qty: safeQty }, token);
+    res = await rpc("fishing_buy", { p_item: target.itemCode, p_qty: target.qty }, token);
   }
 
   const ok = res.status >= 200 && res.status < 300;
+  const serverCoins = extractCoinsFromPayload(res.data);
+  if (typeof serverCoins === "number") {
+    await syncCoins(serverCoins);
+  } else if (ok && target.cost !== null && typeof ACTIVE_ACC.coins === "number") {
+    await syncCoins(Math.max(0, ACTIVE_ACC.coins - target.cost));
+  }
+
+  const costTxt = target.cost !== null ? `${target.cost.toLocaleString("vi-VN")} coin` : "?";
   await pushLog(
     ok ? "SUCCESS" : "WARN",
-    `[${tag}] Mua "${item}" x${safeQty} -> HTTP ${res.status} (${JSON.stringify(res.data).slice(0, 140)})`,
+    `[${tag}] Mua "${target.itemCode}" x${target.qty} (${costTxt}) -> HTTP ${res.status} (${JSON.stringify(res.data).slice(0, 140)})`,
     res.ms
   );
   return { ok, ...res };
@@ -636,10 +764,16 @@ async function sellFish(pFish, tag) {
   }
 
   const ok = res.status >= 200 && res.status < 300;
+  const serverCoins = extractCoinsFromPayload(res.data);
+  if (typeof serverCoins === "number") {
+    await syncCoins(serverCoins);
+  }
+
   const targetDesc = pFish ? `"${pFish}"` : "TẤT CẢ CÁ (null)";
+  const coinInfo = typeof ACTIVE_ACC.coins === "number" ? ` | Ví: ${ACTIVE_ACC.coins.toLocaleString("vi-VN")} coin` : "";
   await pushLog(
     ok ? "SUCCESS" : "WARN",
-    `[${tag}] Bán ${targetDesc} -> HTTP ${res.status} (${JSON.stringify(res.data).slice(0, 140)})`,
+    `[${tag}] Bán ${targetDesc}${coinInfo} -> HTTP ${res.status} (${JSON.stringify(res.data).slice(0, 140)})`,
     res.ms
   );
   return { ok, ...res };
@@ -671,7 +805,7 @@ async function tryAutoRestockOnError(errText, cfg, cycleNum) {
   let restocked = false;
 
   const mentionsRod = /rod|cần|need_rod|no_rod/.test(lower);
-  const mentionsBait = /bait|mồi|ngoc|item|empty|hết|thiếu|not enough|insufficient|no_bait/.test(lower);
+  const mentionsBait = /bait|mồi|ngoc|cam|tom|muc|ca_moi|item|empty|hết|thiếu|not enough|insufficient|no_bait/.test(lower);
 
   if (cfg.auto_buy_rod && cfg.rod_item && (mentionsRod || !mentionsBait)) {
     const r = await buyItem(cfg.rod_item, cfg.rod_qty, `REFILL-ROD #${cycleNum}`);
