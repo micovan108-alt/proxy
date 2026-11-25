@@ -93,7 +93,6 @@ const FISH_DICT = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Biến toàn cục giữ thông tin acc đang chạy trong phiên
 let ACTIVE_ACC = {
   id: "default",
   label: "Mặc định",
@@ -199,7 +198,6 @@ function parseSmartCookies(rawInput) {
     }
   }
 
-  // Trường hợp 1: Mảng JSON xuất từ extension (Cookie-Editor, EditThisCookie...)
   if (parsedArray) {
     const cookies = [];
     for (const item of parsedArray) {
@@ -213,7 +211,6 @@ function parseSmartCookies(rawInput) {
         httpOnly: Boolean(item.httpOnly)
       };
 
-      // Chuẩn hóa sameSite cho Chromium Puppeteer (tránh lỗi null / no_restriction)
       if (item.sameSite) {
         const ss = String(item.sameSite).toLowerCase();
         if (ss === "no_restriction" || ss === "none") c.sameSite = "None";
@@ -230,7 +227,6 @@ function parseSmartCookies(rawInput) {
     return cookies;
   }
 
-  // Trường hợp 2: Chuỗi Cookie header truyền thống ("a=1; b=2")
   const str = String(rawInput).replace(/^Cookie:\s*/i, "").trim();
   const cookies = [];
   for (const pair of str.split(";")) {
@@ -246,6 +242,11 @@ function parseSmartCookies(rawInput) {
     });
   }
   return cookies;
+}
+
+function buildCookieHeader(rawInput) {
+  const cookies = parseSmartCookies(rawInput);
+  return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
 }
 
 function inspectAccountFromCookies(cookies) {
@@ -271,7 +272,6 @@ function inspectAccountFromCookies(cookies) {
   return { uid, username, fullName, hasAuthKey };
 }
 
-// Nạp thông tin tài khoản từ Firebase (worker_accounts) hoặc biến môi trường
 async function resolveTargetAccount() {
   const ctrl = (await fbGet("worker_control")) || {};
   const targetId = (ENV_ACCOUNT_ID || ctrl.active_account || "").trim();
@@ -292,7 +292,6 @@ async function resolveTargetAccount() {
         rawCookie: acc.cookie
       };
 
-      // Tự đồng bộ lại tên thật & UID lên Firebase để trang quản lý hiển thị đẹp
       await fbPatch(`worker_accounts/${targetId}`, {
         uid: ACTIVE_ACC.uid,
         username: ACTIVE_ACC.username,
@@ -304,7 +303,6 @@ async function resolveTargetAccount() {
     }
   }
 
-  // Fallback về biến môi trường LAZI_COOKIE nếu chưa chọn acc trên Firebase
   if (ENV_COOKIE && ENV_COOKIE.trim()) {
     const cookies = parseSmartCookies(ENV_COOKIE);
     const meta = inspectAccountFromCookies(cookies);
@@ -542,21 +540,25 @@ async function getValidToken(forceRefresh = false) {
 }
 
 // =========================================================================
-// GỌI RPC GAME & XỬ LÝ CHU KỲ CÂU CÁ
+// GỌI RPC GAME: FISHING_CAST, FISHING_LAND, FISHING_BUY, FISHING_SELL
 // =========================================================================
 async function rpc(name, body, token) {
   const t0 = Date.now();
+  const cookieHeader = buildCookieHeader(ACTIVE_ACC.rawCookie);
+  const headers = {
+    "Content-Type": "application/json",
+    "Content-Profile": "public",
+    "apikey": APIKEY,
+    "Authorization": `Bearer ${token}`,
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0",
+    "Referer": "https://play.lazi.vn/lobby",
+    "Origin": "https://play.lazi.vn"
+  };
+  if (cookieHeader) headers["Cookie"] = cookieHeader;
+
   const res = await fetch(`${BASE}/${name}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Profile": "public",
-      "apikey": APIKEY,
-      "Authorization": `Bearer ${token}`,
-      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      "Referer": "https://play.lazi.vn/lobby",
-      "Origin": "https://play.lazi.vn"
-    },
+    headers,
     body: JSON.stringify(body)
   });
 
@@ -570,7 +572,119 @@ async function rpc(name, body, token) {
   return { status: res.status, data, ms: Date.now() - t0 };
 }
 
-async function executeSingleCycle(cycleNum) {
+function normalizeAutomationConfig(rawCfg) {
+  const cfg = rawCfg || {};
+  return {
+    auto_buy_rod: Boolean(cfg.auto_buy_rod),
+    rod_item: String(cfg.rod_item || "rod:6").trim(),
+    rod_qty: Math.max(1, Math.min(999, parseInt(cfg.rod_qty, 10) || 1)),
+    rod_every: Math.max(0, parseInt(cfg.rod_every, 10) || 0), // 0 = chỉ mua khi bắt đầu hoặc khi thiếu cần
+
+    auto_buy_bait: Boolean(cfg.auto_buy_bait),
+    bait_item: String(cfg.bait_item || "ngoc").trim(),
+    bait_qty: Math.max(1, Math.min(999, parseInt(cfg.bait_qty, 10) || 1)),
+    bait_every: Math.max(0, parseInt(cfg.bait_every, 10) || 0), // >0: mua mồi định kỳ sau mỗi N lượt
+
+    auto_sell: Boolean(cfg.auto_sell),
+    sell_every: Math.max(1, parseInt(cfg.sell_every, 10) || 25),
+    sell_fish: cfg.sell_fish && String(cfg.sell_fish).trim() !== "" ? String(cfg.sell_fish).trim() : null
+  };
+}
+
+async function getAutomationConfig() {
+  const ctrl = (await fbGet("worker_control")) || {};
+  const perAcc = ctrl.automation?.[ACTIVE_ACC.id];
+  const fallbackShop = ctrl.shop?.[ACTIVE_ACC.id];
+  if (perAcc) return normalizeAutomationConfig(perAcc);
+  if (fallbackShop) {
+    return normalizeAutomationConfig({
+      auto_buy_bait: Boolean(fallbackShop.buy_on_start || fallbackShop.auto_refill),
+      bait_item: fallbackShop.item || "ngoc",
+      bait_qty: fallbackShop.qty || 1
+    });
+  }
+  return normalizeAutomationConfig({});
+}
+
+async function buyItem(item, qty, tag) {
+  if (!item) return { ok: false, raw: "Thiếu mã vật phẩm" };
+  let token = await getValidToken(false);
+  const safeQty = Math.max(1, Math.min(999, parseInt(qty, 10) || 1));
+  let res = await rpc("fishing_buy", { p_item: String(item), p_qty: safeQty }, token);
+
+  if (res.status === 401 || res.status === 403) {
+    token = await getValidToken(true);
+    res = await rpc("fishing_buy", { p_item: String(item), p_qty: safeQty }, token);
+  }
+
+  const ok = res.status >= 200 && res.status < 300;
+  await pushLog(
+    ok ? "SUCCESS" : "WARN",
+    `[${tag}] Mua "${item}" x${safeQty} -> HTTP ${res.status} (${JSON.stringify(res.data).slice(0, 140)})`,
+    res.ms
+  );
+  return { ok, ...res };
+}
+
+async function sellFish(pFish, tag) {
+  let token = await getValidToken(false);
+  let res = await rpc("fishing_sell", { p_fish: pFish ?? null }, token);
+
+  if (res.status === 401 || res.status === 403) {
+    token = await getValidToken(true);
+    res = await rpc("fishing_sell", { p_fish: pFish ?? null }, token);
+  }
+
+  const ok = res.status >= 200 && res.status < 300;
+  const targetDesc = pFish ? `"${pFish}"` : "TẤT CẢ CÁ (null)";
+  await pushLog(
+    ok ? "SUCCESS" : "WARN",
+    `[${tag}] Bán ${targetDesc} -> HTTP ${res.status} (${JSON.stringify(res.data).slice(0, 140)})`,
+    res.ms
+  );
+  return { ok, ...res };
+}
+
+async function runStartupPurchases(cfg) {
+  if (cfg.auto_buy_rod && cfg.rod_item) {
+    await buyItem(cfg.rod_item, cfg.rod_qty, "AUTO-ROD START");
+  }
+  if (cfg.auto_buy_bait && cfg.bait_item) {
+    await buyItem(cfg.bait_item, cfg.bait_qty, "AUTO-BAIT START");
+  }
+}
+
+async function runPeriodicAutomation(cfg, cycleNum) {
+  if (cfg.auto_buy_rod && cfg.rod_every > 0 && cycleNum % cfg.rod_every === 0) {
+    await buyItem(cfg.rod_item, cfg.rod_qty, `AUTO-ROD #${cycleNum}`);
+  }
+  if (cfg.auto_buy_bait && cfg.bait_every > 0 && cycleNum % cfg.bait_every === 0) {
+    await buyItem(cfg.bait_item, cfg.bait_qty, `AUTO-BAIT #${cycleNum}`);
+  }
+  if (cfg.auto_sell && cycleNum % cfg.sell_every === 0) {
+    await sellFish(cfg.sell_fish, `AUTO-SELL #${cycleNum}`);
+  }
+}
+
+async function tryAutoRestockOnError(errText, cfg, cycleNum) {
+  const lower = String(errText || "").toLowerCase();
+  let restocked = false;
+
+  const mentionsRod = /rod|cần|need_rod|no_rod/.test(lower);
+  const mentionsBait = /bait|mồi|ngoc|item|empty|hết|thiếu|not enough|insufficient|no_bait/.test(lower);
+
+  if (cfg.auto_buy_rod && cfg.rod_item && (mentionsRod || !mentionsBait)) {
+    const r = await buyItem(cfg.rod_item, cfg.rod_qty, `REFILL-ROD #${cycleNum}`);
+    if (r.ok) restocked = true;
+  }
+  if (cfg.auto_buy_bait && cfg.bait_item && (mentionsBait || !mentionsRod)) {
+    const r = await buyItem(cfg.bait_item, cfg.bait_qty, `REFILL-BAIT #${cycleNum}`);
+    if (r.ok) restocked = true;
+  }
+  return restocked;
+}
+
+async function executeSingleCycle(cycleNum, cfg) {
   let token = await getValidToken(false);
   const tCycle = Date.now();
 
@@ -583,10 +697,18 @@ async function executeSingleCycle(cycleNum) {
   }
 
   if (castRes.status !== 200 || !castRes.data?.cast) {
-    return {
-      ok: false,
-      detail: `Vòng #${cycleNum} | Thả câu lỗi (HTTP ${castRes.status}): ${JSON.stringify(castRes.data)}`
-    };
+    const errPayload = JSON.stringify(castRes.data);
+    const bought = await tryAutoRestockOnError(errPayload, cfg, cycleNum);
+    if (bought) {
+      await sleep(600);
+      castRes = await rpc("fishing_cast", { p_rod: null }, token);
+    }
+    if (castRes.status !== 200 || !castRes.data?.cast) {
+      return {
+        ok: false,
+        detail: `Vòng #${cycleNum} | Thả câu lỗi (HTTP ${castRes.status}): ${JSON.stringify(castRes.data)}`
+      };
+    }
   }
 
   const { cast, bite_ms = 2000, fight_ms = 1500, fish_tier } = castRes.data;
@@ -598,6 +720,7 @@ async function executeSingleCycle(cycleNum) {
   const totalLatency = Date.now() - tCycle;
 
   if (landRes.status !== 200 || !landRes.data) {
+    await tryAutoRestockOnError(JSON.stringify(landRes.data), cfg, cycleNum);
     return {
       ok: false,
       detail: `Vòng #${cycleNum} | Kéo cá lỗi (HTTP ${landRes.status}): ${JSON.stringify(landRes.data)}`
@@ -662,9 +785,10 @@ async function executeSingleCycle(cycleNum) {
     avg_latency: 0
   });
 
+  const autoCfg = await getAutomationConfig();
   await pushLog(
     "INFO",
-    `=== KHỞI ĐỘNG WORKER #${RUN_ID} (${MAX_HOURS}h, delay ${DELAY_MS}ms) | Acc: ${ACTIVE_ACC.fullName || ACTIVE_ACC.label} (UID: ${ACTIVE_ACC.uid || "N/A"}) ===`
+    `=== KHỞI ĐỘNG WORKER #${RUN_ID} (${MAX_HOURS}h, delay ${DELAY_MS}ms) | Acc: ${ACTIVE_ACC.fullName || ACTIVE_ACC.label} (UID: ${ACTIVE_ACC.uid || "N/A"}) | MuaCần:${autoCfg.auto_buy_rod ? autoCfg.rod_item : "OFF"} | MuaMồi:${autoCfg.auto_buy_bait ? autoCfg.bait_item : "OFF"} | TựBán:${autoCfg.auto_sell ? `mỗi ${autoCfg.sell_every} lượt` : "OFF"} ===`
   );
 
   try {
@@ -674,6 +798,8 @@ async function executeSingleCycle(cycleNum) {
     await fbPatch("worker_control", { status: "idle", last_heartbeat: Date.now() });
     return;
   }
+
+  await runStartupPurchases(autoCfg);
 
   let loopIndex = 0;
   while (Date.now() < END_TIME) {
@@ -690,9 +816,11 @@ async function executeSingleCycle(cycleNum) {
       continue;
     }
 
+    const activeCfg = normalizeAutomationConfig(ctrl.automation?.[ACTIVE_ACC.id] || autoCfg);
+
     loopIndex++;
     try {
-      const result = await executeSingleCycle(loopIndex);
+      const result = await executeSingleCycle(loopIndex, activeCfg);
 
       if (result.ok) {
         okCount++;
@@ -729,6 +857,8 @@ async function executeSingleCycle(cycleNum) {
           `${result.item} (+${result.value} xu, +${result.points}đ) — ${result.detail}`,
           result.latency
         );
+
+        await runPeriodicAutomation(activeCfg, okCount);
       } else {
         errCount++;
         await fbPatch("worker_control", {
@@ -753,6 +883,10 @@ async function executeSingleCycle(cycleNum) {
     }
 
     await sleep(DELAY_MS);
+  }
+
+  if (autoCfg.auto_sell && okCount > 0) {
+    await sellFish(autoCfg.sell_fish, "AUTO-SELL END");
   }
 
   await fbPatch("worker_control", {
