@@ -13,31 +13,53 @@ const AUTH_ENDPOINTS = [
 const APIKEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzk1MzIxNzY4LCJleHAiOjIxMTA2ODE3Njh9.TFy0zQvn7fXnwbaniwb4yvfBfdLp3SXD59pG6w9QQjg";
 
 const MAX_HOURS = Math.max(0.1, Math.min(parseFloat(process.env.RUN_HOURS || "1"), 5));
-const DELAY_MS = Math.max(500, parseInt(process.env.DELAY_MS || "1500", 10));
+const DELAY_MS = Math.max(800, parseInt(process.env.DELAY_MS || "1500", 10));
 const RUN_NOTE = process.env.RUN_NOTE || "Treo câu cá tự động";
 const RUN_ID = process.env.GITHUB_RUN_ID || `local-${Date.now()}`;
 const END_TIME = Date.now() + MAX_HOURS * 3600 * 1000;
 
 // =========================================================================
-// BẢNG GIÁ CẦN CÂU & MỒI CÂU (CẤP 1 -> 6)
+// BẢNG GIÁ, CẤP & UUID MẶC ĐỊNH CỦA CẦN CÂU & MỒI CÂU (CẤP 1 -> 6)
 // =========================================================================
 const ROD_PRICES = {
-  1: { name: "Cần trúc (Cấp 1)", price: 0, free: true },
-  2: { name: "Cần sợi thuỷ tinh (Cấp 2)", price: 500, free: false },
-  3: { name: "Cần carbon (Cấp 3)", price: 1000, free: false },
-  4: { name: "Cần hợp kim (Cấp 4)", price: 3000, free: false },
-  5: { name: "Cần biển sâu (Cấp 5)", price: 7000, free: false },
-  6: { name: "Cần huyền thoại (Cấp 6)", price: 10000, free: false }
+  1: { name: "Cần trúc", price: 0, free: true },
+  2: { name: "Cần sợi thuỷ tinh", price: 500, free: false },
+  3: { name: "Cần carbon", price: 1000, free: false },
+  4: { name: "Cần hợp kim", price: 3000, free: false },
+  5: { name: "Cần biển sâu", price: 7000, free: false },
+  6: { name: "Cần huyền thoại", price: 10000, free: false }
+};
+
+const SEED_RODS_BY_TIER = {
+  "1": ["starter"],
+  "2": ["a6add667-45ca-4d09-b4bc-d461009269dc"],
+  "5": ["fd7f555e-691b-425a-9682-0e4d90b84df3"],
+  "6": [
+    "dd3c29be-f6e6-43b9-bf4b-1c2858a45f9f",
+    "46db5ee0-c28f-4eb4-9386-bad8bbf04a72"
+  ]
+};
+
+const KNOWN_ROD_META = {
+  "starter": { name: "Cần trúc", tier: 1 },
+  "a6add667-45ca-4d09-b4bc-d461009269dc": { name: "Cần sợi thuỷ tinh", tier: 2 },
+  "fd7f555e-691b-425a-9682-0e4d90b84df3": { name: "Cần biển sâu", tier: 5 },
+  "dd3c29be-f6e6-43b9-bf4b-1c2858a45f9f": { name: "Cần huyền thoại", tier: 6 },
+  "46db5ee0-c28f-4eb4-9386-bad8bbf04a72": { name: "Cần huyền thoại", tier: 6 }
 };
 
 const BAIT_BY_CODE = {
-  giun: { code: "giun", tier: 1, name: "Giun đất (Cấp 1)", price: 0, packSize: null, free: true },
-  cam: { code: "cam", tier: 2, name: "Mồi cám (Cấp 2)", price: 100, packSize: 20, free: false },
-  tom: { code: "tom", tier: 3, name: "Tôm tươi (Cấp 3)", price: 200, packSize: 20, free: false },
-  muc: { code: "muc", tier: 4, name: "Mực ống (Cấp 4)", price: 350, packSize: 20, free: false },
-  ca_moi: { code: "ca_moi", tier: 5, name: "Cá mồi sống (Cấp 5)", price: 600, packSize: 20, free: false },
-  ngoc: { code: "ngoc", tier: 6, name: "Ngọc trai mồi (Cấp 6)", price: 800, packSize: 10, free: false }
+  giun: { code: "giun", tier: 1, baitId: "1", name: "Giun đất", price: 0, packSize: null, free: true },
+  cam: { code: "cam", tier: 2, baitId: "2", name: "Mồi cám", price: 100, packSize: 20, free: false },
+  tom: { code: "tom", tier: 3, baitId: "3", name: "Tôm tươi", price: 200, packSize: 20, free: false },
+  muc: { code: "muc", tier: 4, baitId: "4", name: "Mực ống", price: 350, packSize: 20, free: false },
+  ca_moi: { code: "ca_moi", tier: 5, baitId: "5", name: "Cá mồi sống", price: 600, packSize: 20, free: false },
+  ngoc: { code: "ngoc", tier: 6, baitId: "6", name: "Ngọc trai mồi", price: 800, packSize: 10, free: false }
 };
+
+const BAIT_BY_TIER = Object.fromEntries(
+  Object.values(BAIT_BY_CODE).map((b) => [b.tier, b])
+);
 
 const BAIT_ALIAS_TO_CODE = {
   "giun": "giun", "giun_dat": "giun", "1": "giun", "bait:1": "giun",
@@ -78,7 +100,7 @@ function resolvePurchaseTarget(itemStr, qty) {
       qty: safeQty,
       cost: info.free ? 0 : info.price * safeQty,
       free: info.free,
-      label: info.name
+      label: `${info.name} (Cấp ${rodTier})`
     };
   }
 
@@ -88,23 +110,43 @@ function resolvePurchaseTarget(itemStr, qty) {
     return {
       kind: "bait",
       tier: info.tier,
+      baitId: info.baitId,
       itemCode: info.code,
       qty: safeQty,
       cost: info.free ? 0 : info.price * safeQty,
       free: info.free,
-      label: info.name
+      label: `${info.name} (Cấp ${info.tier})`
     };
   }
 
   return {
     kind: "unknown",
     tier: null,
+    baitId: null,
     itemCode: String(itemStr).trim(),
     qty: safeQty,
     cost: null,
     free: false,
     label: String(itemStr).trim()
   };
+}
+
+function formatRodLabel(tier, uuid = null) {
+  if (tier && ROD_PRICES[tier]) return `${ROD_PRICES[tier].name} (C${tier})`;
+  if (uuid && KNOWN_ROD_META[uuid]) {
+    const m = KNOWN_ROD_META[uuid];
+    return `${m.name} (C${m.tier})`;
+  }
+  return uuid ? `Cần (${uuid.slice(0, 8)})` : "Cần mặc định";
+}
+
+function formatBaitLabel(tier, fallbackCode = null) {
+  if (tier && BAIT_BY_TIER[tier]) return `${BAIT_BY_TIER[tier].name} (C${tier})`;
+  if (fallbackCode && BAIT_BY_CODE[fallbackCode]) {
+    const b = BAIT_BY_CODE[fallbackCode];
+    return `${b.name} (C${b.tier})`;
+  }
+  return tier ? `Mồi C${tier}` : "Mồi mặc định";
 }
 
 const FISH_DICT = {
@@ -182,6 +224,23 @@ const FISH_DICT = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function buildSeedRodsPool(savedPool = {}) {
+  const pool = {};
+  for (const [tierKey, uuids] of Object.entries(SEED_RODS_BY_TIER)) {
+    pool[tierKey] = Array.from(new Set(uuids));
+  }
+  if (savedPool && typeof savedPool === "object") {
+    for (const [tierKey, list] of Object.entries(savedPool)) {
+      if (Array.isArray(list)) {
+        pool[tierKey] = Array.from(new Set([...(pool[tierKey] || []), ...list.filter(Boolean)]));
+      } else if (typeof list === "string" && list) {
+        pool[tierKey] = Array.from(new Set([...(pool[tierKey] || []), list]));
+      }
+    }
+  }
+  return pool;
+}
+
 let ACTIVE_ACC = {
   id: "default",
   label: "Mặc định",
@@ -190,27 +249,162 @@ let ACTIVE_ACC = {
   fullName: "",
   rawCookie: "",
   coins: null,
-  // Theo dõi trạng thái cần hiện tại từ phản hồi fishing_land
+  // Danh sách UUID cần theo cấp ("1".."6") + trạng thái từng cây { [uuid]: { durability, broken, tier } }
+  rodsPoolByTier: buildSeedRodsPool(),
+  rodRegistry: {},
+  // Trạng thái cây cần đang cầm thực tế
   rodState: {
     id: null,
     tier: null,
     durability: null,
     broken: false
   },
-  // Theo dõi số mồi còn lại từ phản hồi fishing_cast
+  // Tồn kho mồi theo cấp ("1".."6") và trạng thái mồi hiện tại
+  baitLeftByTier: {},
   baitState: {
     tier: null,
     left: null
   }
 };
 
-// Ưu tiên state.coins (tổng ví thật), fallback sang coins ở root
+function recordRodInfo(uuid, tier = null, durability = null, broken = null) {
+  if (!uuid) return;
+  const effTier = typeof tier === "number" ? tier : (KNOWN_ROD_META[uuid]?.tier ?? null);
+  const prev = ACTIVE_ACC.rodRegistry[uuid] || {};
+  const nextDur = typeof durability === "number" ? durability : (prev.durability ?? null);
+  const nextBroken = typeof broken === "boolean"
+    ? broken
+    : (Boolean(prev.broken) || (typeof nextDur === "number" && nextDur <= 0));
+
+  ACTIVE_ACC.rodRegistry[uuid] = {
+    uuid,
+    tier: effTier ?? prev.tier ?? null,
+    durability: nextDur,
+    broken: nextBroken
+  };
+
+  if (effTier) {
+    const tKey = String(effTier);
+    const arr = ACTIVE_ACC.rodsPoolByTier[tKey] || [];
+    if (!arr.includes(uuid)) {
+      ACTIVE_ACC.rodsPoolByTier[tKey] = [...arr, uuid];
+    }
+  }
+}
+
+function getSelectedRodUuid(cfg) {
+  const target = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
+  const desiredTier = target.kind === "rod" ? target.tier : ACTIVE_ACC.rodState.tier;
+  if (!desiredTier) return ACTIVE_ACC.rodState.id || null;
+
+  if (desiredTier === 1) return "starter";
+
+  const pool = ACTIVE_ACC.rodsPoolByTier[String(desiredTier)] || [];
+  // Ưu tiên cây đang cầm nếu đúng cấp và chưa gãy / còn độ bền
+  if (
+    ACTIVE_ACC.rodState.id &&
+    ACTIVE_ACC.rodState.tier === desiredTier &&
+    !ACTIVE_ACC.rodState.broken &&
+    (ACTIVE_ACC.rodState.durability === null || ACTIVE_ACC.rodState.durability > 0)
+  ) {
+    return ACTIVE_ACC.rodState.id;
+  }
+
+  // Tìm cây còn dùng được trong danh sách UUID của cấp này
+  for (const uuid of pool) {
+    const reg = ACTIVE_ACC.rodRegistry[uuid];
+    if (!reg) return uuid;
+    if (!reg.broken && (reg.durability === null || reg.durability > 0)) {
+      return uuid;
+    }
+  }
+
+  return null;
+}
+
+function getSelectedRodStatus(cfg) {
+  const uuid = getSelectedRodUuid(cfg);
+  const target = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
+  const desiredTier = target.kind === "rod" ? target.tier : ACTIVE_ACC.rodState.tier;
+  const reg = uuid ? ACTIVE_ACC.rodRegistry[uuid] : null;
+  const isCurrent = uuid && ACTIVE_ACC.rodState.id === uuid;
+
+  const durability = isCurrent && typeof ACTIVE_ACC.rodState.durability === "number"
+    ? ACTIVE_ACC.rodState.durability
+    : (typeof reg?.durability === "number" ? reg.durability : null);
+
+  const broken = desiredTier === 1
+    ? false
+    : Boolean(
+        (isCurrent && ACTIVE_ACC.rodState.broken) ||
+        reg?.broken ||
+        (typeof durability === "number" && durability <= 0)
+      );
+
+  const pool = desiredTier ? (ACTIVE_ACC.rodsPoolByTier[String(desiredTier)] || []) : [];
+  const hasAnyUsableInTier = desiredTier === 1 || pool.some((u) => {
+    const r = ACTIVE_ACC.rodRegistry[u];
+    return !r || (!r.broken && (r.durability === null || r.durability > 0));
+  });
+
+  return {
+    uuid,
+    tier: desiredTier,
+    durability,
+    broken,
+    hasAnyUsableInTier
+  };
+}
+
+function getSelectedBaitStatus(cfg) {
+  const target = resolvePurchaseTarget(cfg.bait_item, cfg.bait_qty);
+  const desiredTier = target.kind === "bait" ? target.tier : ACTIVE_ACC.baitState.tier;
+  if (!desiredTier) {
+    return { tier: null, left: ACTIVE_ACC.baitState.left, code: null };
+  }
+  const info = BAIT_BY_TIER[desiredTier];
+  if (desiredTier === 1 || info?.free) {
+    return { tier: 1, left: null, code: "giun", free: true };
+  }
+  const left = typeof ACTIVE_ACC.baitLeftByTier[String(desiredTier)] === "number"
+    ? ACTIVE_ACC.baitLeftByTier[String(desiredTier)]
+    : (ACTIVE_ACC.baitState.tier === desiredTier ? ACTIVE_ACC.baitState.left : null);
+
+  return {
+    tier: desiredTier,
+    left,
+    code: info?.code || null,
+    free: false
+  };
+}
+
+// Ưu tiên state.coins (tổng ví thật), fallback sang coins ở root / data
 function extractCoinsFromPayload(payload) {
   if (!payload || typeof payload !== "object") return null;
   if (payload.state && typeof payload.state.coins === "number") return payload.state.coins;
   if (payload.data && payload.data.state && typeof payload.data.state.coins === "number") return payload.data.state.coins;
   if (typeof payload.coins === "number") return payload.coins;
   if (payload.data && typeof payload.data.coins === "number") return payload.data.coins;
+  return null;
+}
+
+function extractRodFromPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const candidate =
+    payload.rod ||
+    payload.state?.rod ||
+    payload.data?.rod ||
+    payload.data?.state?.rod ||
+    null;
+
+  if (candidate && typeof candidate === "object") {
+    return {
+      id: candidate.id || null,
+      tier: typeof candidate.tier === "number" ? candidate.tier : null,
+      durability: typeof candidate.durability === "number" ? candidate.durability : null,
+      broken: Boolean(candidate.broken)
+    };
+  }
   return null;
 }
 
@@ -223,6 +417,26 @@ async function syncCoins(newCoins) {
       coins_updated_at: Date.now()
     });
   }
+}
+
+async function syncGearTelemetry() {
+  if (!ACTIVE_ACC.id || ACTIVE_ACC.id === "default") return;
+  const rs = ACTIVE_ACC.rodState;
+  const bs = ACTIVE_ACC.baitState;
+  await fbPatch(`worker_accounts/${ACTIVE_ACC.id}`, {
+    active_rod_id: rs.id || null,
+    active_rod_tier: rs.tier ?? null,
+    active_rod_name: formatRodLabel(rs.tier, rs.id),
+    active_rod_durability: rs.durability ?? null,
+    active_rod_broken: Boolean(rs.broken),
+    rods_pool_by_tier: ACTIVE_ACC.rodsPoolByTier,
+    rod_registry: ACTIVE_ACC.rodRegistry,
+    bait_left_by_tier: ACTIVE_ACC.baitLeftByTier,
+    active_bait_tier: bs.tier ?? null,
+    active_bait_name: formatBaitLabel(bs.tier),
+    active_bait_left: bs.left ?? null,
+    gear_updated_at: Date.now()
+  });
 }
 
 // =========================================================================
@@ -414,8 +628,19 @@ async function resolveTargetAccount() {
         fullName: meta.fullName || acc.full_name || "",
         rawCookie: acc.cookie,
         coins: typeof acc.coins === "number" ? acc.coins : null,
-        rodState: { id: null, tier: null, durability: null, broken: false },
-        baitState: { tier: null, left: null }
+        rodsPoolByTier: buildSeedRodsPool(acc.rods_pool_by_tier || acc.rods_by_tier),
+        rodRegistry: acc.rod_registry && typeof acc.rod_registry === "object" ? { ...acc.rod_registry } : {},
+        rodState: {
+          id: acc.active_rod_id || null,
+          tier: typeof acc.active_rod_tier === "number" ? acc.active_rod_tier : null,
+          durability: typeof acc.active_rod_durability === "number" ? acc.active_rod_durability : null,
+          broken: Boolean(acc.active_rod_broken)
+        },
+        baitLeftByTier: acc.bait_left_by_tier && typeof acc.bait_left_by_tier === "object" ? { ...acc.bait_left_by_tier } : {},
+        baitState: {
+          tier: typeof acc.active_bait_tier === "number" ? acc.active_bait_tier : null,
+          left: typeof acc.active_bait_left === "number" ? acc.active_bait_left : null
+        }
       };
 
       await fbPatch(`worker_accounts/${targetId}`, {
@@ -443,7 +668,10 @@ async function resolveTargetAccount() {
       fullName: meta.fullName,
       rawCookie: ENV_COOKIE,
       coins: null,
+      rodsPoolByTier: buildSeedRodsPool(),
+      rodRegistry: {},
       rodState: { id: null, tier: null, durability: null, broken: false },
+      baitLeftByTier: {},
       baitState: { tier: null, left: null }
     };
     return cookies;
@@ -453,9 +681,9 @@ async function resolveTargetAccount() {
 }
 
 // =========================================================================
-// PUPPETEER SSO EXTRACTOR
+// PUPPETEER SSO EXTRACTOR + ĐỌC/ĐỒNG BỘ CẦN & MỒI TRONG LOCALSTORAGE
 // =========================================================================
-async function fetchTokensViaPuppeteer(preloadedCookies = null) {
+async function fetchTokensViaPuppeteer(preloadedCookies = null, desiredCfg = null) {
   const cookies = preloadedCookies || (await resolveTargetAccount());
   if (!cookies.length) {
     throw new Error("Danh sách cookie sau khi phân tích bị rỗng (0 cookie hợp lệ)!");
@@ -593,6 +821,42 @@ async function fetchTokensViaPuppeteer(preloadedCookies = null) {
       );
     }
 
+    const baitTarget = desiredCfg ? resolvePurchaseTarget(desiredCfg.bait_item, desiredCfg.bait_qty) : null;
+    const rodTarget = desiredCfg ? resolvePurchaseTarget(desiredCfg.rod_item, desiredCfg.rod_qty) : null;
+    const desiredBaitId = baitTarget?.kind === "bait" && baitTarget.baitId ? baitTarget.baitId : null;
+    const desiredRodUuid = rodTarget?.kind === "rod" ? getSelectedRodUuid(desiredCfg) : null;
+
+    const fishingLocal = await page.evaluate(({ targetBaitId, targetRodUuid }) => {
+      try {
+        if (targetBaitId) {
+          window.localStorage.setItem("blockstage.fishing.bait", String(targetBaitId));
+        }
+        if (targetRodUuid) {
+          window.localStorage.setItem("blockstage.fishing.rod", String(targetRodUuid));
+        }
+        return {
+          rodId: window.localStorage.getItem("blockstage.fishing.rod") || null,
+          baitId: window.localStorage.getItem("blockstage.fishing.bait") || null
+        };
+      } catch {
+        return { rodId: null, baitId: null };
+      }
+    }, { targetBaitId: desiredBaitId, targetRodUuid: desiredRodUuid });
+
+    if (fishingLocal.rodId) {
+      recordRodInfo(fishingLocal.rodId);
+      if (!ACTIVE_ACC.rodState.id) {
+        ACTIVE_ACC.rodState.id = fishingLocal.rodId;
+        ACTIVE_ACC.rodState.tier = KNOWN_ROD_META[fishingLocal.rodId]?.tier ?? null;
+      }
+    }
+    if (fishingLocal.baitId && /^\d+$/.test(fishingLocal.baitId)) {
+      const parsedBait = parseInt(fishingLocal.baitId, 10);
+      if (!ACTIVE_ACC.baitState.tier) {
+        ACTIVE_ACC.baitState.tier = parsedBait;
+      }
+    }
+
     await fbPatch(`worker_auth/${ACTIVE_ACC.id}`, {
       access_token: session.access_token,
       refresh_token: session.refresh_token,
@@ -603,9 +867,11 @@ async function fetchTokensViaPuppeteer(preloadedCookies = null) {
       username: ACTIVE_ACC.username
     });
 
+    await syncGearTelemetry();
+
     await pushLog(
       "INFO",
-      `[SSO 5/5] Bắt thành công token từ ${session.source} | Refresh: ${session.refresh_token.slice(0, 6)}***`,
+      `[SSO 5/5] Bắt thành công token từ ${session.source} | Cần:${formatRodLabel(ACTIVE_ACC.rodState.tier, fishingLocal.rodId)} | Mồi:${formatBaitLabel(ACTIVE_ACC.baitState.tier)}`,
       Date.now() - tStart
     );
 
@@ -749,7 +1015,7 @@ async function buyItem(item, qty, tag) {
     if (ACTIVE_ACC.coins < target.cost) {
       await pushLog(
         "WARN",
-        `[${tag}] Không đủ coin mua ${target.label} (${target.itemCode}) x${target.qty} (Cần ${target.cost.toLocaleString("vi-VN")} coin, ví đang có ${ACTIVE_ACC.coins.toLocaleString("vi-VN")} coin)`
+        `[${tag}] Không đủ coin mua ${target.label} x${target.qty} (Cần ${target.cost.toLocaleString("vi-VN")} coin, ví còn ${ACTIVE_ACC.coins.toLocaleString("vi-VN")} coin) — bỏ qua mua.`
       );
       return { ok: false, skipped: "insufficient_coins" };
     }
@@ -771,10 +1037,35 @@ async function buyItem(item, qty, tag) {
     await syncCoins(Math.max(0, ACTIVE_ACC.coins - target.cost));
   }
 
-  // Nếu vừa mua cần mới thành công thì reset trạng thái hỏng của cần để dùng cần mới
   if (ok && target.kind === "rod") {
-    ACTIVE_ACC.rodState.broken = false;
-    ACTIVE_ACC.rodState.durability = null;
+    const boughtRod = extractRodFromPayload(res.data);
+    if (boughtRod && boughtRod.id) {
+      const rTier = boughtRod.tier || target.tier;
+      recordRodInfo(boughtRod.id, rTier, boughtRod.durability ?? 100, false);
+      ACTIVE_ACC.rodState = {
+        id: boughtRod.id,
+        tier: rTier,
+        durability: boughtRod.durability ?? 100,
+        broken: false
+      };
+    } else {
+      ACTIVE_ACC.rodState = {
+        id: null,
+        tier: target.tier,
+        durability: 100,
+        broken: false
+      };
+    }
+    await syncGearTelemetry();
+  }
+
+  if (ok && target.kind === "bait") {
+    if (target.tier) {
+      ACTIVE_ACC.baitState.tier = target.tier;
+      ACTIVE_ACC.baitState.left = null;
+      delete ACTIVE_ACC.baitLeftByTier[String(target.tier)];
+    }
+    await syncGearTelemetry();
   }
 
   const costTxt = target.cost !== null ? `${target.cost.toLocaleString("vi-VN")} coin` : "?";
@@ -812,48 +1103,34 @@ async function sellFish(pFish, tag) {
   return { ok, ...res };
 }
 
-// Kiểm tra độ bền cần: chỉ mua khi broken === true hoặc durability <= 0
+// Kiểm tra độ bền cần ĐƯỢC CHỌN: chỉ đi mua khi cần được chọn hết/gãy và không còn cây khả dụng cùng cấp
 async function checkAndBuyRodIfNeeded(cfg, tag) {
   if (!cfg.auto_buy_rod || !cfg.rod_item) return false;
   const target = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
-  if (target.free) return false;
+  if (target.kind !== "rod" || target.free) return false;
 
-  const rs = ACTIVE_ACC.rodState;
-  const rodExpiredOrBroken =
-    rs.broken === true ||
-    (typeof rs.durability === "number" && rs.durability <= 0);
-
-  // Nếu đã biết cần đang còn độ bền (> 0) và chưa gãy thì KHÔNG mua thêm
-  if (!rodExpiredOrBroken && typeof rs.durability === "number" && rs.durability > 0) {
+  const sel = getSelectedRodStatus(cfg);
+  if (!sel.broken && !sel.hasAnyUsableInTier && sel.durability !== null && sel.durability > 0) {
     return false;
   }
 
-  // Nếu chưa từng có thông tin độ bền (vừa khởi động) nhưng cần cấp mục tiêu khác tier cần hiện tại, hoặc cần hiện tại đã gãy/hết độ bền
-  const shouldBuy =
-    rodExpiredOrBroken ||
-    (rs.durability === null && rs.tier !== null && target.tier && rs.tier < target.tier);
-
-  if (!shouldBuy) return false;
+  const needsBuy = sel.broken || !sel.hasAnyUsableInTier;
+  if (!needsBuy) return false;
 
   const r = await buyItem(cfg.rod_item, cfg.rod_qty, tag);
   return Boolean(r.ok);
 }
 
-// Kiểm tra số mồi còn lại từ bait_left của fishing_cast: chỉ mua khi bait_left <= 0
+// Kiểm tra mồi ĐƯỢC CHỌN: chỉ đi mua khi mồi được chọn hết (bait_left <= 0)
 async function checkAndBuyBaitIfNeeded(cfg, tag) {
   if (!cfg.auto_buy_bait || !cfg.bait_item) return false;
   const target = resolvePurchaseTarget(cfg.bait_item, cfg.bait_qty);
-  if (target.free) return false;
+  if (target.kind !== "bait" || target.free) return false;
 
-  const bs = ACTIVE_ACC.baitState;
-  // Chỉ mua khi đã biết bait_left <= 0 (và nếu có bait_tier thì ưu tiên khớp cấp mồi đang chọn)
-  const baitDepleted = typeof bs.left === "number" && bs.left <= 0;
-  if (!baitDepleted) return false;
+  const selBait = getSelectedBaitStatus(cfg);
+  if (typeof selBait.left !== "number" || selBait.left > 0) return false;
 
   const r = await buyItem(cfg.bait_item, cfg.bait_qty, tag);
-  if (r.ok) {
-    ACTIVE_ACC.baitState.left = null;
-  }
   return Boolean(r.ok);
 }
 
@@ -877,12 +1154,22 @@ async function tryAutoRestockOnError(errText, cfg, cycleNum) {
   const mentionsBait = /bait|mồi|ngoc|cam|tom|muc|ca_moi|item|empty|hết|thiếu|not enough|insufficient|no_bait/.test(lower);
 
   if (cfg.auto_buy_rod && cfg.rod_item && mentionsRod) {
-    ACTIVE_ACC.rodState.broken = true;
-    ACTIVE_ACC.rodState.durability = 0;
+    const sel = getSelectedRodStatus(cfg);
+    if (sel.uuid) {
+      recordRodInfo(sel.uuid, sel.tier, 0, true);
+    }
+    if (ACTIVE_ACC.rodState.id === sel.uuid || !ACTIVE_ACC.rodState.id) {
+      ACTIVE_ACC.rodState.broken = true;
+      ACTIVE_ACC.rodState.durability = 0;
+    }
     const bought = await checkAndBuyRodIfNeeded(cfg, `REFILL-ROD #${cycleNum}`);
     if (bought) restocked = true;
   }
   if (cfg.auto_buy_bait && cfg.bait_item && mentionsBait) {
+    const selBait = getSelectedBaitStatus(cfg);
+    if (selBait.tier) {
+      ACTIVE_ACC.baitLeftByTier[String(selBait.tier)] = 0;
+    }
     ACTIVE_ACC.baitState.left = 0;
     const bought = await checkAndBuyBaitIfNeeded(cfg, `REFILL-BAIT #${cycleNum}`);
     if (bought) restocked = true;
@@ -890,29 +1177,38 @@ async function tryAutoRestockOnError(errText, cfg, cycleNum) {
   return restocked;
 }
 
-function getPreferredRodParam(cfg) {
-  const target = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
-  const rs = ACTIVE_ACC.rodState;
-  if (
-    target.kind === "rod" &&
-    rs.id &&
-    !rs.broken &&
-    (rs.durability === null || rs.durability > 0) &&
-    rs.tier === target.tier
-  ) {
-    return rs.id;
-  }
-  return null;
+function buildGearStatusText(cfg, fallbackBaitLeft = null, fallbackBaitTier = null) {
+  const selRod = getSelectedRodStatus(cfg);
+  const rodName = formatRodLabel(selRod.tier, selRod.uuid);
+  const durStr = selRod.tier === 1
+    ? "∞"
+    : (typeof selRod.durability === "number"
+        ? `${selRod.durability}%${selRod.broken ? " [HẾT/GÃY]" : ""}`
+        : (selRod.broken ? "HẾT/GÃY" : "?%"));
+
+  const selBait = getSelectedBaitStatus(cfg);
+  const effBaitTier = selBait.tier ?? fallbackBaitTier ?? ACTIVE_ACC.baitState.tier;
+  const effBaitLeft = typeof selBait.left === "number"
+    ? selBait.left
+    : (typeof fallbackBaitLeft === "number" ? fallbackBaitLeft : ACTIVE_ACC.baitState.left);
+
+  const baitName = formatBaitLabel(effBaitTier, cfg.bait_item);
+  const baitLeftStr = effBaitTier === 1
+    ? "∞"
+    : (typeof effBaitLeft === "number" ? `${effBaitLeft}` : "?");
+
+  return `Cần: ${rodName} [Độ bền: ${durStr}] | Mồi: ${baitName} [Còn: ${baitLeftStr}]`;
 }
 
 async function executeSingleCycle(cycleNum, cfg) {
   let token = await getValidToken(false);
   const tCycle = Date.now();
 
-  // Nếu mồi đã hết (bait_left <= 0) từ lượt trước thì mua thêm trước khi thả câu
+  // Kiểm tra trước lượt: nếu cần được chọn hết/gãy hoặc mồi được chọn hết thì đi mua nếu đủ coin
+  await checkAndBuyRodIfNeeded(cfg, `PRE-CAST-ROD #${cycleNum}`);
   await checkAndBuyBaitIfNeeded(cfg, `PRE-CAST-BAIT #${cycleNum}`);
 
-  const pRod = getPreferredRodParam(cfg);
+  const pRod = getSelectedRodUuid(cfg);
   let castRes = await rpc("fishing_cast", { p_rod: pRod }, token);
 
   if (castRes.status === 401 || castRes.status === 403) {
@@ -921,13 +1217,33 @@ async function executeSingleCycle(cycleNum, cfg) {
     castRes = await rpc("fishing_cast", { p_rod: pRod }, token);
   }
 
-  // Cập nhật bait_left & bait_tier ngay khi fishing_cast trả về
+  if (castRes.status === 400 && castRes.data?.message === "too_fast") {
+    await pushLog("WARN", `Vòng #${cycleNum}: Server báo too_fast, nghỉ 2.5s rồi thả lại...`);
+    await sleep(2500);
+    castRes = await rpc("fishing_cast", { p_rod: pRod }, token);
+  }
+
+  const castCoins = extractCoinsFromPayload(castRes.data);
+  if (typeof castCoins === "number") await syncCoins(castCoins);
+
   if (castRes.status === 200 && castRes.data) {
+    const bTier = typeof castRes.data.bait_tier === "number"
+      ? castRes.data.bait_tier
+      : (resolvePurchaseTarget(cfg.bait_item, cfg.bait_qty).tier ?? ACTIVE_ACC.baitState.tier);
+
     if (typeof castRes.data.bait_left === "number") {
       ACTIVE_ACC.baitState.left = castRes.data.bait_left;
+      if (bTier) ACTIVE_ACC.baitLeftByTier[String(bTier)] = castRes.data.bait_left;
     }
     if (typeof castRes.data.bait_tier === "number") {
       ACTIVE_ACC.baitState.tier = castRes.data.bait_tier;
+    }
+    if (typeof castRes.data.rod_tier === "number") {
+      ACTIVE_ACC.rodState.tier = castRes.data.rod_tier;
+    }
+    if (pRod) {
+      ACTIVE_ACC.rodState.id = pRod;
+      recordRodInfo(pRod, ACTIVE_ACC.rodState.tier);
     }
   }
 
@@ -935,22 +1251,28 @@ async function executeSingleCycle(cycleNum, cfg) {
     const errPayload = JSON.stringify(castRes.data);
     const bought = await tryAutoRestockOnError(errPayload, cfg, cycleNum);
     if (bought) {
-      await sleep(600);
-      castRes = await rpc("fishing_cast", { p_rod: getPreferredRodParam(cfg) }, token);
-      if (castRes.status === 200 && castRes.data && typeof castRes.data.bait_left === "number") {
-        ACTIVE_ACC.baitState.left = castRes.data.bait_left;
+      await sleep(700);
+      const nextRod = getSelectedRodUuid(cfg);
+      castRes = await rpc("fishing_cast", { p_rod: nextRod }, token);
+      if (castRes.status === 200 && castRes.data) {
+        if (typeof castRes.data.bait_left === "number") {
+          ACTIVE_ACC.baitState.left = castRes.data.bait_left;
+          const bT = castRes.data.bait_tier ?? ACTIVE_ACC.baitState.tier;
+          if (bT) ACTIVE_ACC.baitLeftByTier[String(bT)] = castRes.data.bait_left;
+        }
+        if (typeof castRes.data.bait_tier === "number") ACTIVE_ACC.baitState.tier = castRes.data.bait_tier;
       }
     }
     if (castRes.status !== 200 || !castRes.data?.cast) {
       return {
         ok: false,
-        detail: `Vòng #${cycleNum} | Thả câu lỗi (HTTP ${castRes.status}): ${JSON.stringify(castRes.data)}`
+        detail: `Vòng #${cycleNum} | Thả câu lỗi (HTTP ${castRes.status}): ${JSON.stringify(castRes.data)} | ${buildGearStatusText(cfg)}`
       };
     }
   }
 
-  const { cast, bite_ms = 2000, fight_ms = 1500, fish_tier, bait_left } = castRes.data;
-  const waitTotal = bite_ms + fight_ms + 250;
+  const { cast, bite_ms = 2000, fight_ms = 1500, fish_tier, bait_left, bait_tier } = castRes.data;
+  const waitTotal = bite_ms + fight_ms + 300;
 
   await sleep(waitTotal);
 
@@ -961,38 +1283,53 @@ async function executeSingleCycle(cycleNum, cfg) {
     await tryAutoRestockOnError(JSON.stringify(landRes.data), cfg, cycleNum);
     return {
       ok: false,
-      detail: `Vòng #${cycleNum} | Kéo cá lỗi (HTTP ${landRes.status}): ${JSON.stringify(landRes.data)}`
+      detail: `Vòng #${cycleNum} | Kéo cá lỗi (HTTP ${landRes.status}): ${JSON.stringify(landRes.data)} | ${buildGearStatusText(cfg, bait_left, bait_tier)}`
     };
   }
 
   const d = landRes.data;
+  const landCoins = extractCoinsFromPayload(d);
+  if (typeof landCoins === "number") await syncCoins(landCoins);
 
-  // Cập nhật độ bền cần (durability / broken / id / tier) từ fishing_land
   if (d.rod && typeof d.rod === "object") {
-    const durVal = typeof d.rod.durability === "number" ? d.rod.durability : null;
-    const isBroken = Boolean(d.rod.broken) || (durVal !== null && durVal <= 0);
+    const durVal = typeof d.rod.durability === "number" ? d.rod.durability : ACTIVE_ACC.rodState.durability;
+    const isBroken = Boolean(d.rod.broken) || (typeof durVal === "number" && durVal <= 0);
+    const nextRodId = d.rod.id || ACTIVE_ACC.rodState.id || pRod;
+    const nextRodTier = typeof d.rod.tier === "number"
+      ? d.rod.tier
+      : (ACTIVE_ACC.rodState.tier ?? KNOWN_ROD_META[nextRodId]?.tier ?? null);
+
     ACTIVE_ACC.rodState = {
-      id: d.rod.id || ACTIVE_ACC.rodState.id,
-      tier: typeof d.rod.tier === "number" ? d.rod.tier : ACTIVE_ACC.rodState.tier,
+      id: nextRodId,
+      tier: nextRodTier,
       durability: durVal,
       broken: isBroken
     };
 
+    if (nextRodId) {
+      recordRodInfo(nextRodId, nextRodTier, durVal, isBroken);
+    }
+
+    await syncGearTelemetry();
+
     if (isBroken) {
-      await pushLog("WARN", `Vòng #${cycleNum} | Cần đã hết độ bền / gãy (durability=${durVal ?? 0})`);
+      await pushLog("WARN", `Vòng #${cycleNum} | ${formatRodLabel(nextRodTier, nextRodId)} đã hết độ bền / gãy (Độ bền: ${durVal ?? 0}%)`);
       await checkAndBuyRodIfNeeded(cfg, `BROKEN-ROD #${cycleNum}`);
     }
+  } else {
+    await syncGearTelemetry();
   }
 
-  // Nếu lượt này bait_left vừa chạm 0 thì mua thêm mồi cho vòng tiếp theo
   if (typeof bait_left === "number" && bait_left <= 0) {
     await checkAndBuyBaitIfNeeded(cfg, `EMPTY-BAIT #${cycleNum}`);
   }
 
+  const gearText = buildGearStatusText(cfg, bait_left, bait_tier);
+
   if (d.result !== "caught") {
     return {
       ok: false,
-      detail: `Vòng #${cycleNum} | Cá sổng mất (result=${d.result || "unknown"}, tier=${fish_tier ?? "?"})`
+      detail: `Vòng #${cycleNum} | Cá sổng mất (result=${d.result || "unknown"}, tier=${fish_tier ?? "?"}) | ${gearText}`
     };
   }
 
@@ -1002,8 +1339,6 @@ async function executeSingleCycle(cycleNum, cfg) {
     (fishId ? `Cá ${fishId.replace(/_/g, " ")}` : `Cá Tier ${fish_tier ?? 1} (Hiếm ${d.rarity ?? 0})`);
 
   const newTag = d.new ? " [MỚI!]" : "";
-  const durTxt = typeof ACTIVE_ACC.rodState.durability === "number" ? ` | Độ bền: ${ACTIVE_ACC.rodState.durability}` : "";
-  const baitTxt = typeof bait_left === "number" ? ` | Mồi còn: ${bait_left}` : "";
 
   return {
     ok: true,
@@ -1011,7 +1346,7 @@ async function executeSingleCycle(cycleNum, cfg) {
     value: Number(d.value || 0),
     points: Number(d.points || 0),
     latency: totalLatency,
-    detail: `#${cycleNum}${newTag} | ${d.size ?? "?"}m - ${d.weight ?? "?"}kg | Túi: ${d.count ?? "?"} | Điểm tổng: ${d.score ?? "?"}${durTxt}${baitTxt} | Cast:${castRes.ms}ms + Chờ:${waitTotal}ms + Land:${landRes.ms}ms`
+    detail: `#${cycleNum}${newTag} | ${d.size ?? "?"}m - ${d.weight ?? "?"}kg | Túi: ${d.count ?? "?"} | Điểm tổng: ${d.score ?? "?"} | ${gearText} | Cast:${castRes.ms}ms + Chờ:${waitTotal}ms + Land:${landRes.ms}ms`
   };
 }
 
@@ -1051,11 +1386,11 @@ async function executeSingleCycle(cycleNum, cfg) {
   const autoCfg = await getAutomationConfig();
   await pushLog(
     "INFO",
-    `=== KHỞI ĐỘNG WORKER #${RUN_ID} (${MAX_HOURS}h, delay ${DELAY_MS}ms) | Acc: ${ACTIVE_ACC.fullName || ACTIVE_ACC.label} (UID: ${ACTIVE_ACC.uid || "N/A"}) | MuaCần:${autoCfg.auto_buy_rod ? autoCfg.rod_item : "OFF"} | MuaMồi:${autoCfg.auto_buy_bait ? autoCfg.bait_item : "OFF"} | TựBán:${autoCfg.auto_sell ? `mỗi ${autoCfg.sell_every} lượt` : "OFF"} ===`
+    `=== KHỞI ĐỘNG WORKER #${RUN_ID} (${MAX_HOURS}h, delay ${DELAY_MS}ms) | Acc: ${ACTIVE_ACC.fullName || ACTIVE_ACC.label} (UID: ${ACTIVE_ACC.uid || "N/A"}) | Cần chọn:${autoCfg.rod_item} (Mua:${autoCfg.auto_buy_rod ? "ON" : "OFF"}) | Mồi chọn:${autoCfg.bait_item} (Mua:${autoCfg.auto_buy_bait ? "ON" : "OFF"}) | TựBán:${autoCfg.auto_sell ? `mỗi ${autoCfg.sell_every} lượt` : "OFF"} ===`
   );
 
   try {
-    await fetchTokensViaPuppeteer(initialCookies);
+    await fetchTokensViaPuppeteer(initialCookies, autoCfg);
   } catch (err) {
     await pushLog("ERROR", `Dừng worker do lỗi khởi tạo phiên: ${err.message}`);
     await fbPatch("worker_control", { status: "idle", last_heartbeat: Date.now() });
@@ -1105,12 +1440,19 @@ async function executeSingleCycle(cycleNum, cfg) {
           last_seen: Date.now()
         });
 
+        const selRod = getSelectedRodStatus(activeCfg);
+        const selBait = getSelectedBaitStatus(activeCfg);
+
         await fbPatch("worker_control", {
           status: "running",
           last_heartbeat: Date.now(),
           ok_count: okCount,
           err_count: errCount,
-          avg_latency: avgLat
+          avg_latency: avgLat,
+          active_rod_name: formatRodLabel(selRod.tier, selRod.uuid),
+          active_rod_durability: selRod.durability ?? null,
+          active_bait_name: formatBaitLabel(selBait.tier, activeCfg.bait_item),
+          active_bait_left: selBait.left ?? null
         });
 
         await pushLog(
