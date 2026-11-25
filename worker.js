@@ -20,7 +20,6 @@ const END_TIME = Date.now() + MAX_HOURS * 3600 * 1000;
 
 // =========================================================================
 // BẢNG GIÁ CẦN CÂU & MỒI CÂU (CẤP 1 -> 6)
-// Mồi chuẩn: cam | tom | muc | ca_moi | ngoc (giun cấp 1 có sẵn miễn phí)
 // =========================================================================
 const ROD_PRICES = {
   1: { name: "Cần trúc (Cấp 1)", price: 0, free: true },
@@ -73,6 +72,8 @@ function resolvePurchaseTarget(itemStr, qty) {
   if (rodTier) {
     const info = ROD_PRICES[rodTier];
     return {
+      kind: "rod",
+      tier: rodTier,
       itemCode: `rod:${rodTier}`,
       qty: safeQty,
       cost: info.free ? 0 : info.price * safeQty,
@@ -85,6 +86,8 @@ function resolvePurchaseTarget(itemStr, qty) {
   if (baitCode && BAIT_BY_CODE[baitCode]) {
     const info = BAIT_BY_CODE[baitCode];
     return {
+      kind: "bait",
+      tier: info.tier,
       itemCode: info.code,
       qty: safeQty,
       cost: info.free ? 0 : info.price * safeQty,
@@ -94,6 +97,8 @@ function resolvePurchaseTarget(itemStr, qty) {
   }
 
   return {
+    kind: "unknown",
+    tier: null,
     itemCode: String(itemStr).trim(),
     qty: safeQty,
     cost: null,
@@ -184,13 +189,27 @@ let ACTIVE_ACC = {
   username: "",
   fullName: "",
   rawCookie: "",
-  coins: null
+  coins: null,
+  // Theo dõi trạng thái cần hiện tại từ phản hồi fishing_land
+  rodState: {
+    id: null,
+    tier: null,
+    durability: null,
+    broken: false
+  },
+  // Theo dõi số mồi còn lại từ phản hồi fishing_cast
+  baitState: {
+    tier: null,
+    left: null
+  }
 };
 
+// Ưu tiên state.coins (tổng ví thật), fallback sang coins ở root
 function extractCoinsFromPayload(payload) {
   if (!payload || typeof payload !== "object") return null;
-  if (typeof payload.coins === "number") return payload.coins;
   if (payload.state && typeof payload.state.coins === "number") return payload.state.coins;
+  if (payload.data && payload.data.state && typeof payload.data.state.coins === "number") return payload.data.state.coins;
+  if (typeof payload.coins === "number") return payload.coins;
   if (payload.data && typeof payload.data.coins === "number") return payload.data.coins;
   return null;
 }
@@ -199,7 +218,10 @@ async function syncCoins(newCoins) {
   if (typeof newCoins !== "number" || Number.isNaN(newCoins)) return;
   ACTIVE_ACC.coins = newCoins;
   if (ACTIVE_ACC.id && ACTIVE_ACC.id !== "default") {
-    await fbPatch(`worker_accounts/${ACTIVE_ACC.id}`, { coins: newCoins, coins_updated_at: Date.now() });
+    await fbPatch(`worker_accounts/${ACTIVE_ACC.id}`, {
+      coins: newCoins,
+      coins_updated_at: Date.now()
+    });
   }
 }
 
@@ -391,7 +413,9 @@ async function resolveTargetAccount() {
         username: meta.username || acc.username || "",
         fullName: meta.fullName || acc.full_name || "",
         rawCookie: acc.cookie,
-        coins: typeof acc.coins === "number" ? acc.coins : null
+        coins: typeof acc.coins === "number" ? acc.coins : null,
+        rodState: { id: null, tier: null, durability: null, broken: false },
+        baitState: { tier: null, left: null }
       };
 
       await fbPatch(`worker_accounts/${targetId}`, {
@@ -418,7 +442,9 @@ async function resolveTargetAccount() {
       username: meta.username,
       fullName: meta.fullName,
       rawCookie: ENV_COOKIE,
-      coins: null
+      coins: null,
+      rodState: { id: null, tier: null, durability: null, broken: false },
+      baitState: { tier: null, left: null }
     };
     return cookies;
   }
@@ -723,7 +749,7 @@ async function buyItem(item, qty, tag) {
     if (ACTIVE_ACC.coins < target.cost) {
       await pushLog(
         "WARN",
-        `[${tag}] Không đủ coin mua ${target.label} (${target.itemCode}) x${target.qty} (Cần ${target.cost.toLocaleString("vi-VN")} coin, đang có ${ACTIVE_ACC.coins.toLocaleString("vi-VN")} coin)`
+        `[${tag}] Không đủ coin mua ${target.label} (${target.itemCode}) x${target.qty} (Cần ${target.cost.toLocaleString("vi-VN")} coin, ví đang có ${ACTIVE_ACC.coins.toLocaleString("vi-VN")} coin)`
       );
       return { ok: false, skipped: "insufficient_coins" };
     }
@@ -745,10 +771,17 @@ async function buyItem(item, qty, tag) {
     await syncCoins(Math.max(0, ACTIVE_ACC.coins - target.cost));
   }
 
+  // Nếu vừa mua cần mới thành công thì reset trạng thái hỏng của cần để dùng cần mới
+  if (ok && target.kind === "rod") {
+    ACTIVE_ACC.rodState.broken = false;
+    ACTIVE_ACC.rodState.durability = null;
+  }
+
   const costTxt = target.cost !== null ? `${target.cost.toLocaleString("vi-VN")} coin` : "?";
+  const coinTxt = typeof ACTIVE_ACC.coins === "number" ? ` | Ví: ${ACTIVE_ACC.coins.toLocaleString("vi-VN")} coin` : "";
   await pushLog(
     ok ? "SUCCESS" : "WARN",
-    `[${tag}] Mua "${target.itemCode}" x${target.qty} (${costTxt}) -> HTTP ${res.status} (${JSON.stringify(res.data).slice(0, 140)})`,
+    `[${tag}] Mua "${target.itemCode}" x${target.qty} (${costTxt})${coinTxt} -> HTTP ${res.status} (${JSON.stringify(res.data).slice(0, 140)})`,
     res.ms
   );
   return { ok, ...res };
@@ -779,21 +812,57 @@ async function sellFish(pFish, tag) {
   return { ok, ...res };
 }
 
-async function runStartupPurchases(cfg) {
-  if (cfg.auto_buy_rod && cfg.rod_item) {
-    await buyItem(cfg.rod_item, cfg.rod_qty, "AUTO-ROD START");
+// Kiểm tra độ bền cần: chỉ mua khi broken === true hoặc durability <= 0
+async function checkAndBuyRodIfNeeded(cfg, tag) {
+  if (!cfg.auto_buy_rod || !cfg.rod_item) return false;
+  const target = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
+  if (target.free) return false;
+
+  const rs = ACTIVE_ACC.rodState;
+  const rodExpiredOrBroken =
+    rs.broken === true ||
+    (typeof rs.durability === "number" && rs.durability <= 0);
+
+  // Nếu đã biết cần đang còn độ bền (> 0) và chưa gãy thì KHÔNG mua thêm
+  if (!rodExpiredOrBroken && typeof rs.durability === "number" && rs.durability > 0) {
+    return false;
   }
-  if (cfg.auto_buy_bait && cfg.bait_item) {
-    await buyItem(cfg.bait_item, cfg.bait_qty, "AUTO-BAIT START");
+
+  // Nếu chưa từng có thông tin độ bền (vừa khởi động) nhưng cần cấp mục tiêu khác tier cần hiện tại, hoặc cần hiện tại đã gãy/hết độ bền
+  const shouldBuy =
+    rodExpiredOrBroken ||
+    (rs.durability === null && rs.tier !== null && target.tier && rs.tier < target.tier);
+
+  if (!shouldBuy) return false;
+
+  const r = await buyItem(cfg.rod_item, cfg.rod_qty, tag);
+  return Boolean(r.ok);
+}
+
+// Kiểm tra số mồi còn lại từ bait_left của fishing_cast: chỉ mua khi bait_left <= 0
+async function checkAndBuyBaitIfNeeded(cfg, tag) {
+  if (!cfg.auto_buy_bait || !cfg.bait_item) return false;
+  const target = resolvePurchaseTarget(cfg.bait_item, cfg.bait_qty);
+  if (target.free) return false;
+
+  const bs = ACTIVE_ACC.baitState;
+  // Chỉ mua khi đã biết bait_left <= 0 (và nếu có bait_tier thì ưu tiên khớp cấp mồi đang chọn)
+  const baitDepleted = typeof bs.left === "number" && bs.left <= 0;
+  if (!baitDepleted) return false;
+
+  const r = await buyItem(cfg.bait_item, cfg.bait_qty, tag);
+  if (r.ok) {
+    ACTIVE_ACC.baitState.left = null;
   }
+  return Boolean(r.ok);
 }
 
 async function runPeriodicAutomation(cfg, cycleNum) {
   if (cfg.auto_buy_rod && cfg.rod_every > 0 && cycleNum % cfg.rod_every === 0) {
-    await buyItem(cfg.rod_item, cfg.rod_qty, `AUTO-ROD #${cycleNum}`);
+    await checkAndBuyRodIfNeeded(cfg, `AUTO-ROD #${cycleNum}`);
   }
   if (cfg.auto_buy_bait && cfg.bait_every > 0 && cycleNum % cfg.bait_every === 0) {
-    await buyItem(cfg.bait_item, cfg.bait_qty, `AUTO-BAIT #${cycleNum}`);
+    await checkAndBuyBaitIfNeeded(cfg, `AUTO-BAIT #${cycleNum}`);
   }
   if (cfg.auto_sell && cycleNum % cfg.sell_every === 0) {
     await sellFish(cfg.sell_fish, `AUTO-SELL #${cycleNum}`);
@@ -804,30 +873,62 @@ async function tryAutoRestockOnError(errText, cfg, cycleNum) {
   const lower = String(errText || "").toLowerCase();
   let restocked = false;
 
-  const mentionsRod = /rod|cần|need_rod|no_rod/.test(lower);
+  const mentionsRod = /rod|cần|need_rod|no_rod|durability|broken/.test(lower);
   const mentionsBait = /bait|mồi|ngoc|cam|tom|muc|ca_moi|item|empty|hết|thiếu|not enough|insufficient|no_bait/.test(lower);
 
-  if (cfg.auto_buy_rod && cfg.rod_item && (mentionsRod || !mentionsBait)) {
-    const r = await buyItem(cfg.rod_item, cfg.rod_qty, `REFILL-ROD #${cycleNum}`);
-    if (r.ok) restocked = true;
+  if (cfg.auto_buy_rod && cfg.rod_item && mentionsRod) {
+    ACTIVE_ACC.rodState.broken = true;
+    ACTIVE_ACC.rodState.durability = 0;
+    const bought = await checkAndBuyRodIfNeeded(cfg, `REFILL-ROD #${cycleNum}`);
+    if (bought) restocked = true;
   }
-  if (cfg.auto_buy_bait && cfg.bait_item && (mentionsBait || !mentionsRod)) {
-    const r = await buyItem(cfg.bait_item, cfg.bait_qty, `REFILL-BAIT #${cycleNum}`);
-    if (r.ok) restocked = true;
+  if (cfg.auto_buy_bait && cfg.bait_item && mentionsBait) {
+    ACTIVE_ACC.baitState.left = 0;
+    const bought = await checkAndBuyBaitIfNeeded(cfg, `REFILL-BAIT #${cycleNum}`);
+    if (bought) restocked = true;
   }
   return restocked;
+}
+
+function getPreferredRodParam(cfg) {
+  const target = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
+  const rs = ACTIVE_ACC.rodState;
+  if (
+    target.kind === "rod" &&
+    rs.id &&
+    !rs.broken &&
+    (rs.durability === null || rs.durability > 0) &&
+    rs.tier === target.tier
+  ) {
+    return rs.id;
+  }
+  return null;
 }
 
 async function executeSingleCycle(cycleNum, cfg) {
   let token = await getValidToken(false);
   const tCycle = Date.now();
 
-  let castRes = await rpc("fishing_cast", { p_rod: null }, token);
+  // Nếu mồi đã hết (bait_left <= 0) từ lượt trước thì mua thêm trước khi thả câu
+  await checkAndBuyBaitIfNeeded(cfg, `PRE-CAST-BAIT #${cycleNum}`);
+
+  const pRod = getPreferredRodParam(cfg);
+  let castRes = await rpc("fishing_cast", { p_rod: pRod }, token);
 
   if (castRes.status === 401 || castRes.status === 403) {
     await pushLog("WARN", `Vòng #${cycleNum}: Token bị từ chối (${castRes.status}), đang làm mới...`);
     token = await getValidToken(true);
-    castRes = await rpc("fishing_cast", { p_rod: null }, token);
+    castRes = await rpc("fishing_cast", { p_rod: pRod }, token);
+  }
+
+  // Cập nhật bait_left & bait_tier ngay khi fishing_cast trả về
+  if (castRes.status === 200 && castRes.data) {
+    if (typeof castRes.data.bait_left === "number") {
+      ACTIVE_ACC.baitState.left = castRes.data.bait_left;
+    }
+    if (typeof castRes.data.bait_tier === "number") {
+      ACTIVE_ACC.baitState.tier = castRes.data.bait_tier;
+    }
   }
 
   if (castRes.status !== 200 || !castRes.data?.cast) {
@@ -835,7 +936,10 @@ async function executeSingleCycle(cycleNum, cfg) {
     const bought = await tryAutoRestockOnError(errPayload, cfg, cycleNum);
     if (bought) {
       await sleep(600);
-      castRes = await rpc("fishing_cast", { p_rod: null }, token);
+      castRes = await rpc("fishing_cast", { p_rod: getPreferredRodParam(cfg) }, token);
+      if (castRes.status === 200 && castRes.data && typeof castRes.data.bait_left === "number") {
+        ACTIVE_ACC.baitState.left = castRes.data.bait_left;
+      }
     }
     if (castRes.status !== 200 || !castRes.data?.cast) {
       return {
@@ -845,7 +949,7 @@ async function executeSingleCycle(cycleNum, cfg) {
     }
   }
 
-  const { cast, bite_ms = 2000, fight_ms = 1500, fish_tier } = castRes.data;
+  const { cast, bite_ms = 2000, fight_ms = 1500, fish_tier, bait_left } = castRes.data;
   const waitTotal = bite_ms + fight_ms + 250;
 
   await sleep(waitTotal);
@@ -862,6 +966,29 @@ async function executeSingleCycle(cycleNum, cfg) {
   }
 
   const d = landRes.data;
+
+  // Cập nhật độ bền cần (durability / broken / id / tier) từ fishing_land
+  if (d.rod && typeof d.rod === "object") {
+    const durVal = typeof d.rod.durability === "number" ? d.rod.durability : null;
+    const isBroken = Boolean(d.rod.broken) || (durVal !== null && durVal <= 0);
+    ACTIVE_ACC.rodState = {
+      id: d.rod.id || ACTIVE_ACC.rodState.id,
+      tier: typeof d.rod.tier === "number" ? d.rod.tier : ACTIVE_ACC.rodState.tier,
+      durability: durVal,
+      broken: isBroken
+    };
+
+    if (isBroken) {
+      await pushLog("WARN", `Vòng #${cycleNum} | Cần đã hết độ bền / gãy (durability=${durVal ?? 0})`);
+      await checkAndBuyRodIfNeeded(cfg, `BROKEN-ROD #${cycleNum}`);
+    }
+  }
+
+  // Nếu lượt này bait_left vừa chạm 0 thì mua thêm mồi cho vòng tiếp theo
+  if (typeof bait_left === "number" && bait_left <= 0) {
+    await checkAndBuyBaitIfNeeded(cfg, `EMPTY-BAIT #${cycleNum}`);
+  }
+
   if (d.result !== "caught") {
     return {
       ok: false,
@@ -875,6 +1002,8 @@ async function executeSingleCycle(cycleNum, cfg) {
     (fishId ? `Cá ${fishId.replace(/_/g, " ")}` : `Cá Tier ${fish_tier ?? 1} (Hiếm ${d.rarity ?? 0})`);
 
   const newTag = d.new ? " [MỚI!]" : "";
+  const durTxt = typeof ACTIVE_ACC.rodState.durability === "number" ? ` | Độ bền: ${ACTIVE_ACC.rodState.durability}` : "";
+  const baitTxt = typeof bait_left === "number" ? ` | Mồi còn: ${bait_left}` : "";
 
   return {
     ok: true,
@@ -882,7 +1011,7 @@ async function executeSingleCycle(cycleNum, cfg) {
     value: Number(d.value || 0),
     points: Number(d.points || 0),
     latency: totalLatency,
-    detail: `#${cycleNum}${newTag} | ${d.size ?? "?"}m - ${d.weight ?? "?"}kg | Túi: ${d.count ?? "?"} | Điểm tổng: ${d.score ?? "?"} | Cast:${castRes.ms}ms + Chờ:${waitTotal}ms + Land:${landRes.ms}ms`
+    detail: `#${cycleNum}${newTag} | ${d.size ?? "?"}m - ${d.weight ?? "?"}kg | Túi: ${d.count ?? "?"} | Điểm tổng: ${d.score ?? "?"}${durTxt}${baitTxt} | Cast:${castRes.ms}ms + Chờ:${waitTotal}ms + Land:${landRes.ms}ms`
   };
 }
 
@@ -932,8 +1061,6 @@ async function executeSingleCycle(cycleNum, cfg) {
     await fbPatch("worker_control", { status: "idle", last_heartbeat: Date.now() });
     return;
   }
-
-  await runStartupPurchases(autoCfg);
 
   let loopIndex = 0;
   while (Date.now() < END_TIME) {
