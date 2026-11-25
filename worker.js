@@ -2,7 +2,8 @@ const puppeteer = require("puppeteer");
 
 const DB_URL = process.env.FIREBASE_DB_URL || "https://chat-4e280-default-rtdb.firebaseio.com";
 const DB_SECRET = process.env.FIREBASE_DB_SECRET || "";
-const LAZI_COOKIE = process.env.LAZI_COOKIE || "";
+const ENV_COOKIE = process.env.LAZI_COOKIE || "";
+const ENV_ACCOUNT_ID = process.env.ACCOUNT_ID || "";
 
 const BASE = "https://play.lazi.vn/rest/v1/rpc";
 const AUTH_ENDPOINTS = [
@@ -92,8 +93,18 @@ const FISH_DICT = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Biến toàn cục giữ thông tin acc đang chạy trong phiên
+let ACTIVE_ACC = {
+  id: "default",
+  label: "Mặc định",
+  uid: "",
+  username: "",
+  fullName: "",
+  rawCookie: ""
+};
+
 // =========================================================================
-// FIREBASE REALTIME DATABASE HELPERS (CÓ CHỐNG RỚT MẠNG)
+// FIREBASE REALTIME DATABASE HELPERS
 // =========================================================================
 function dbEndpoint(path) {
   const clean = path.replace(/^\/+|\/+$/g, "");
@@ -136,15 +147,17 @@ async function fbPost(path, data) {
 }
 
 async function pushLog(level, msg, latency = null) {
+  const prefix = ACTIVE_ACC.label ? `[${ACTIVE_ACC.label}] ` : "";
   const entry = {
     ts: Date.now(),
-    level, // INFO | SUCCESS | WARN | ERROR
-    msg,
+    level,
+    msg: `${prefix}${msg}`,
     latency,
-    run_id: RUN_ID
+    run_id: RUN_ID,
+    account_id: ACTIVE_ACC.id
   };
   const latStr = latency !== null ? ` (${latency}ms)` : "";
-  console.log(`[${new Date().toISOString()}] [${level}] ${msg}${latStr}`);
+  console.log(`[${new Date().toISOString()}] [${level}] ${prefix}${msg}${latStr}`);
   await fbPost("worker_logs", entry);
 }
 
@@ -162,15 +175,175 @@ async function pruneOldLogs(keep = 180) {
 }
 
 // =========================================================================
-// PUPPETEER SSO EXTRACTOR (BẮT GÓI TIN MẠNG + QUÉT STORAGE + LOG CHI TIẾT)
+// BỘ PHÂN TÍCH COOKIE ĐA ĐỊNH DẠNG (JSON ARRAY HOẶC HEADER STRING) & NHẬN DIỆN ACC
 // =========================================================================
-async function fetchTokensViaPuppeteer() {
-  if (!LAZI_COOKIE || !LAZI_COOKIE.trim()) {
-    throw new Error("Biến LAZI_COOKIE trong GitHub Secrets đang trống!");
+function parseSmartCookies(rawInput) {
+  if (!rawInput) return [];
+
+  let parsedArray = null;
+
+  if (Array.isArray(rawInput)) {
+    parsedArray = rawInput;
+  } else if (typeof rawInput === "object" && Array.isArray(rawInput.cookies)) {
+    parsedArray = rawInput.cookies;
+  } else if (typeof rawInput === "string") {
+    const trimmed = rawInput.trim();
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      try {
+        const obj = JSON.parse(trimmed);
+        if (Array.isArray(obj)) parsedArray = obj;
+        else if (obj && Array.isArray(obj.cookies)) parsedArray = obj.cookies;
+      } catch (e) {
+        throw new Error(`Chuỗi JSON cookie bị lỗi cú pháp: ${e.message}`);
+      }
+    }
+  }
+
+  // Trường hợp 1: Mảng JSON xuất từ extension (Cookie-Editor, EditThisCookie...)
+  if (parsedArray) {
+    const cookies = [];
+    for (const item of parsedArray) {
+      if (!item || !item.name) continue;
+      const c = {
+        name: String(item.name).trim(),
+        value: item.value !== undefined && item.value !== null ? String(item.value) : "",
+        domain: item.domain ? String(item.domain).trim() : ".lazi.vn",
+        path: item.path ? String(item.path).trim() : "/",
+        secure: Boolean(item.secure),
+        httpOnly: Boolean(item.httpOnly)
+      };
+
+      // Chuẩn hóa sameSite cho Chromium Puppeteer (tránh lỗi null / no_restriction)
+      if (item.sameSite) {
+        const ss = String(item.sameSite).toLowerCase();
+        if (ss === "no_restriction" || ss === "none") c.sameSite = "None";
+        else if (ss === "lax") c.sameSite = "Lax";
+        else if (ss === "strict") c.sameSite = "Strict";
+      }
+
+      if (typeof item.expirationDate === "number" && item.expirationDate > 0) {
+        c.expires = Math.floor(item.expirationDate);
+      }
+
+      cookies.push(c);
+    }
+    return cookies;
+  }
+
+  // Trường hợp 2: Chuỗi Cookie header truyền thống ("a=1; b=2")
+  const str = String(rawInput).replace(/^Cookie:\s*/i, "").trim();
+  const cookies = [];
+  for (const pair of str.split(";")) {
+    const p = pair.trim();
+    const eqIdx = p.indexOf("=");
+    if (eqIdx <= 0) continue;
+    cookies.push({
+      name: p.slice(0, eqIdx).trim(),
+      value: p.slice(eqIdx + 1).trim(),
+      domain: ".lazi.vn",
+      path: "/",
+      secure: true
+    });
+  }
+  return cookies;
+}
+
+function inspectAccountFromCookies(cookies) {
+  const map = {};
+  for (const c of cookies) {
+    map[c.name] = c.value;
+  }
+
+  const uid = map.lazi_identity || map.lazi_identity_code || "";
+  let username = "";
+  let fullName = "";
+
+  if (map.lazi_user_info) {
+    try {
+      const decoded = decodeURIComponent(map.lazi_user_info.replace(/\+/g, " "));
+      const info = JSON.parse(decoded);
+      username = info.username || "";
+      fullName = info.full_name || "";
+    } catch {}
+  }
+
+  const hasAuthKey = Boolean(map.lazi_remember_code || map.lazi_user_code || map.lazi_cms);
+  return { uid, username, fullName, hasAuthKey };
+}
+
+// Nạp thông tin tài khoản từ Firebase (worker_accounts) hoặc biến môi trường
+async function resolveTargetAccount() {
+  const ctrl = (await fbGet("worker_control")) || {};
+  const targetId = (ENV_ACCOUNT_ID || ctrl.active_account || "").trim();
+
+  if (targetId) {
+    const acc = await fbGet(`worker_accounts/${targetId}`);
+    if (acc && acc.cookie) {
+      const cookies = parseSmartCookies(acc.cookie);
+      const meta = inspectAccountFromCookies(cookies);
+      const label = acc.name || meta.fullName || meta.username || meta.uid || targetId;
+
+      ACTIVE_ACC = {
+        id: targetId,
+        label,
+        uid: meta.uid || acc.uid || "",
+        username: meta.username || acc.username || "",
+        fullName: meta.fullName || acc.full_name || "",
+        rawCookie: acc.cookie
+      };
+
+      // Tự đồng bộ lại tên thật & UID lên Firebase để trang quản lý hiển thị đẹp
+      await fbPatch(`worker_accounts/${targetId}`, {
+        uid: ACTIVE_ACC.uid,
+        username: ACTIVE_ACC.username,
+        full_name: ACTIVE_ACC.fullName,
+        last_used: Date.now()
+      });
+
+      return cookies;
+    }
+  }
+
+  // Fallback về biến môi trường LAZI_COOKIE nếu chưa chọn acc trên Firebase
+  if (ENV_COOKIE && ENV_COOKIE.trim()) {
+    const cookies = parseSmartCookies(ENV_COOKIE);
+    const meta = inspectAccountFromCookies(cookies);
+    const autoId = meta.uid ? `acc_${meta.uid}` : "default";
+    const label = meta.fullName || meta.username || meta.uid || "Secret Mặc Định";
+
+    ACTIVE_ACC = {
+      id: autoId,
+      label,
+      uid: meta.uid,
+      username: meta.username,
+      fullName: meta.fullName,
+      rawCookie: ENV_COOKIE
+    };
+    return cookies;
+  }
+
+  throw new Error("Không tìm thấy cookie nào (cả worker_accounts trên Firebase lẫn LAZI_COOKIE đều trống)!");
+}
+
+// =========================================================================
+// PUPPETEER SSO EXTRACTOR
+// =========================================================================
+async function fetchTokensViaPuppeteer(preloadedCookies = null) {
+  const cookies = preloadedCookies || (await resolveTargetAccount());
+  if (!cookies.length) {
+    throw new Error("Danh sách cookie sau khi phân tích bị rỗng (0 cookie hợp lệ)!");
+  }
+
+  const meta = inspectAccountFromCookies(cookies);
+  if (!meta.hasAuthKey) {
+    throw new Error("Bộ cookie thiếu khóa đăng nhập (lazi_remember_code / lazi_user_code). Hãy copy lại đủ cookie khi đã đăng nhập!");
   }
 
   const tStart = Date.now();
-  await pushLog("INFO", "[SSO 1/5] Khởi chạy Chromium Headless trên runner...");
+  await pushLog(
+    "INFO",
+    `[SSO 1/5] Khởi chạy Chromium | Nhận diện acc: ${meta.fullName || "?"} (@${meta.username || "?"} | ID: ${meta.uid || "?"}) — ${cookies.length} cookie`
+  );
 
   const browser = await puppeteer.launch({
     headless: true,
@@ -226,47 +399,22 @@ async function fetchTokensViaPuppeteer() {
       } catch {}
     });
 
-    const rawPairs = LAZI_COOKIE.split(";").map((p) => p.trim()).filter(Boolean);
-    const cookies = [];
-    for (const pair of rawPairs) {
-      const eqIdx = pair.indexOf("=");
-      if (eqIdx <= 0) continue;
-      const name = pair.slice(0, eqIdx).trim();
-      const value = pair.slice(eqIdx + 1).trim();
-      cookies.push({
-        name,
-        value,
-        domain: ".lazi.vn",
-        path: "/",
-        secure: true
-      });
-    }
-
     await page.setCookie(...cookies);
-    await pushLog("INFO", `[SSO 2/5] Đã nạp ${cookies.length} cookie vào trình duyệt ảo.`);
+    await pushLog("INFO", `[SSO 2/5] Đã nạp ${cookies.length} cookie chuẩn định dạng vào trình duyệt.`);
 
     const resMain = await page.goto("https://lazi.vn/", {
       waitUntil: "domcontentloaded",
       timeout: 30000
     }).catch(() => null);
-    const mainStatus = resMain ? resMain.status() : "N/A";
-    const isLoggedInLazi = await page.evaluate(() => {
-      const html = document.body ? document.body.innerHTML : "";
-      return html.includes("4253820") || html.includes("tien-nam") || html.includes("logout");
-    });
-    await pushLog(
-      "INFO",
-      `[SSO 3/5] Mở lazi.vn (HTTP ${mainStatus}) | Nhận diện đăng nhập gốc: ${isLoggedInLazi ? "CÓ" : "KHÔNG THẤY"}`
-    );
+    await pushLog("INFO", `[SSO 3/5] Ping lazi.vn (HTTP ${resMain ? resMain.status() : "N/A"})`);
 
     const resLobby = await page.goto("https://play.lazi.vn/lobby", {
       waitUntil: "networkidle2",
       timeout: 45000
     });
-    const lobbyStatus = resLobby ? resLobby.status() : "N/A";
     await pushLog(
       "INFO",
-      `[SSO 4/5] Mở play.lazi.vn/lobby (HTTP ${lobbyStatus}) -> URL hiện tại: ${page.url()}`
+      `[SSO 4/5] Mở play.lazi.vn/lobby (HTTP ${resLobby ? resLobby.status() : "N/A"}) -> URL: ${page.url()}`
     );
 
     let session = null;
@@ -311,21 +459,21 @@ async function fetchTokensViaPuppeteer() {
       const diag = await page.evaluate(() => ({
         url: location.href,
         title: document.title,
-        lsKeys: Object.keys(localStorage),
-        ssKeys: Object.keys(sessionStorage),
-        bodyPreview: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 160)
+        lsKeys: Object.keys(localStorage)
       }));
       throw new Error(
-        `Không bắt được token sau 20s | URL=${diag.url} | Title="${diag.title}" | LS=${JSON.stringify(diag.lsKeys)} | Text="${diag.bodyPreview}"`
+        `Không bắt được token sau 20s (cookie có thể đã hết hạn) | URL=${diag.url} | Title="${diag.title}" | LS=${JSON.stringify(diag.lsKeys)}`
       );
     }
 
-    await fbPatch("worker_auth", {
+    await fbPatch(`worker_auth/${ACTIVE_ACC.id}`, {
       access_token: session.access_token,
       refresh_token: session.refresh_token,
       expires_at: Date.now() + 3300 * 1000,
       updated_at: Date.now(),
-      source: session.source
+      source: session.source,
+      uid: ACTIVE_ACC.uid,
+      username: ACTIVE_ACC.username
     });
 
     await pushLog(
@@ -341,10 +489,11 @@ async function fetchTokensViaPuppeteer() {
 }
 
 // =========================================================================
-// QUẢN LÝ TOKEN: DÙNG CACHE -> ĐỔI QUA API -> LỖI THÌ GỌI PUPPETEER
+// QUẢN LÝ TOKEN RIÊNG TỪNG ACC
 // =========================================================================
 async function getValidToken(forceRefresh = false) {
-  const authData = (await fbGet("worker_auth")) || {};
+  const authPath = `worker_auth/${ACTIVE_ACC.id}`;
+  const authData = (await fbGet(authPath)) || {};
 
   if (
     !forceRefresh &&
@@ -371,7 +520,7 @@ async function getValidToken(forceRefresh = false) {
 
         const data = await res.json().catch(() => ({}));
         if (res.ok && data.access_token && data.refresh_token) {
-          await fbPatch("worker_auth", {
+          await fbPatch(authPath, {
             access_token: data.access_token,
             refresh_token: data.refresh_token,
             expires_at: Date.now() + (data.expires_in || 3600) * 1000,
@@ -386,14 +535,14 @@ async function getValidToken(forceRefresh = false) {
         }
       } catch {}
     }
-    await pushLog("WARN", "Refresh token trên Firebase đã hết hiệu lực, gọi Puppeteer lấy lại phiên mới...");
+    await pushLog("WARN", "Refresh token đã hết hiệu lực, bật Puppeteer lấy lại phiên từ cookie...");
   }
 
   return await fetchTokensViaPuppeteer();
 }
 
 // =========================================================================
-// GỌI RPC GAME & XỬ LÝ CHU KỲ CÂU CÁ CHI TIẾT
+// GỌI RPC GAME & XỬ LÝ CHU KỲ CÂU CÁ
 // =========================================================================
 async function rpc(name, body, token) {
   const t0 = Date.now();
@@ -425,7 +574,6 @@ async function executeSingleCycle(cycleNum) {
   let token = await getValidToken(false);
   const tCycle = Date.now();
 
-  // Pha 1: Thả câu
   let castRes = await rpc("fishing_cast", { p_rod: null }, token);
 
   if (castRes.status === 401 || castRes.status === 403) {
@@ -444,10 +592,8 @@ async function executeSingleCycle(cycleNum) {
   const { cast, bite_ms = 2000, fight_ms = 1500, fish_tier } = castRes.data;
   const waitTotal = bite_ms + fight_ms + 250;
 
-  // Pha 2: Chờ cá cắn câu & giằng co
   await sleep(waitTotal);
 
-  // Pha 3: Giật cần kéo cá
   const landRes = await rpc("fishing_land", { p_cast: cast, p_ok: true }, token);
   const totalLatency = Date.now() - tCycle;
 
@@ -491,12 +637,23 @@ async function executeSingleCycle(cycleNum) {
   let errCount = 0;
   let totalLatency = 0;
 
+  let initialCookies = [];
+  try {
+    initialCookies = await resolveTargetAccount();
+  } catch (err) {
+    await pushLog("ERROR", `Không nạp được tài khoản: ${err.message}`);
+    await fbPatch("worker_control", { status: "idle", last_heartbeat: Date.now() });
+    return;
+  }
+
   await fbPatch("worker_control", {
     status: "running",
     stop: false,
     paused: false,
     run_id: RUN_ID,
     note: RUN_NOTE,
+    active_account: ACTIVE_ACC.id,
+    active_account_name: ACTIVE_ACC.label,
     started_at: Date.now(),
     ends_at: END_TIME,
     last_heartbeat: Date.now(),
@@ -505,10 +662,13 @@ async function executeSingleCycle(cycleNum) {
     avg_latency: 0
   });
 
-  await pushLog("INFO", `=== KHỞI ĐỘNG WORKER #${RUN_ID} (${MAX_HOURS}h, delay ${DELAY_MS}ms) — ${RUN_NOTE} ===`);
+  await pushLog(
+    "INFO",
+    `=== KHỞI ĐỘNG WORKER #${RUN_ID} (${MAX_HOURS}h, delay ${DELAY_MS}ms) | Acc: ${ACTIVE_ACC.fullName || ACTIVE_ACC.label} (UID: ${ACTIVE_ACC.uid || "N/A"}) ===`
+  );
 
   try {
-    await fetchTokensViaPuppeteer();
+    await fetchTokensViaPuppeteer(initialCookies);
   } catch (err) {
     await pushLog("ERROR", `Dừng worker do lỗi khởi tạo phiên: ${err.message}`);
     await fbPatch("worker_control", { status: "idle", last_heartbeat: Date.now() });
@@ -540,14 +700,15 @@ async function executeSingleCycle(cycleNum) {
         const avgLat = Math.round(totalLatency / okCount);
 
         const safeKey = (result.item || "Khác").replace(/[.#$/\[\]]/g, "_");
-        const curItem = (await fbGet(`worker_items/${safeKey}`)) || {
+        const itemPath = `worker_items/${ACTIVE_ACC.id}/${safeKey}`;
+        const curItem = (await fbGet(itemPath)) || {
           name: result.item || "Khác",
           count: 0,
           total_value: 0,
           total_points: 0
         };
 
-        await fbPatch(`worker_items/${safeKey}`, {
+        await fbPatch(itemPath, {
           name: result.item || "Khác",
           count: curItem.count + 1,
           total_value: curItem.total_value + Number(result.value || 0),
