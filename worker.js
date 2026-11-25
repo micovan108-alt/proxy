@@ -1,6 +1,8 @@
+const puppeteer = require("puppeteer");
+
 const DB_URL = process.env.FIREBASE_DB_URL || "https://chat-4e280-default-rtdb.firebaseio.com";
 const DB_SECRET = process.env.FIREBASE_DB_SECRET || "";
-const INITIAL_REFRESH_TOKEN = process.env.MY_REFRESH_TOKEN || "3z7r7ttgceht";
+const LAZI_COOKIE = process.env.LAZI_COOKIE || "";
 
 const BASE = "https://play.lazi.vn/rest/v1/rpc";
 const AUTH_ENDPOINTS = [
@@ -46,13 +48,7 @@ async function fbPost(path, data) {
 }
 
 async function pushLog(level, msg, latency = null) {
-  const entry = {
-    ts: Date.now(),
-    level, // INFO | SUCCESS | WARN | ERROR
-    msg,
-    latency,
-    run_id: RUN_ID
-  };
+  const entry = { ts: Date.now(), level, msg, latency, run_id: RUN_ID };
   console.log(`[${level}] ${msg}`);
   await fbPost("worker_logs", entry);
 }
@@ -69,7 +65,93 @@ async function pruneOldLogs(keep = 150) {
 }
 
 // =========================================================================
-// TỰ ĐỘNG GIA HẠN & XOAY VÒNG REFRESH TOKEN TRÊN FIREBASE
+// MỞ PUPPETEER NẠP COOKIE VÀO SẢNH ĐỂ TỰ LẤY CẶP TOKEN MỚI
+// =========================================================================
+async function fetchTokensViaPuppeteer() {
+  if (!LAZI_COOKIE) {
+    throw new Error("Thiếu biến LAZI_COOKIE trong GitHub Secrets!");
+  }
+
+  await pushLog("INFO", "Đang khởi chạy trình duyệt ảo để đăng nhập SSO lấy token...");
+  const browser = await puppeteer.launch({
+    headless: "new",
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0");
+
+    // Chặn tải ảnh, CSS, font để trang load siêu nhanh và nhẹ RAM
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      if (["image", "stylesheet", "font", "media"].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    // Tách chuỗi cookie và gắn vào domain .lazi.vn
+    const cookies = LAZI_COOKIE.split(";")
+      .map((pair) => pair.trim())
+      .filter(Boolean)
+      .map((pair) => {
+        const eqIdx = pair.indexOf("=");
+        return {
+          name: pair.slice(0, eqIdx).trim(),
+          value: pair.slice(eqIdx + 1).trim(),
+          domain: ".lazi.vn",
+          path: "/"
+        };
+      });
+
+    await page.setCookie(...cookies);
+    await page.goto("https://play.lazi.vn/lobby", { waitUntil: "networkidle2", timeout: 45000 });
+
+    // Chờ JS trên trang hoàn tất xác thực SSO và ghi session vào localStorage (tối đa 15s)
+    let session = null;
+    for (let i = 0; i < 15; i++) {
+      session = await page.evaluate(() => {
+        for (let j = 0; j < localStorage.length; j++) {
+          const k = localStorage.key(j);
+          const v = localStorage.getItem(k);
+          if (k.includes("auth-token") || (v && v.includes("access_token"))) {
+            try {
+              const parsed = JSON.parse(v);
+              const s = parsed.currentSession || parsed;
+              if (s && s.access_token && s.refresh_token) {
+                return { access_token: s.access_token, refresh_token: s.refresh_token };
+              }
+            } catch {}
+          }
+        }
+        return null;
+      });
+      if (session) break;
+      await sleep(1000);
+    }
+
+    if (!session) {
+      throw new Error("Không thấy token trong localStorage (có thể cookie LAZI_COOKIE đã hết hạn).");
+    }
+
+    await fbPatch("worker_auth", {
+      access_token: session.access_token,
+      refresh_token: session.refresh_token,
+      expires_at: Date.now() + 3300 * 1000,
+      updated_at: Date.now()
+    });
+
+    await pushLog("INFO", "Puppeteer đã lấy thành công cặp token mới và đóng trình duyệt.");
+    return session.access_token;
+  } finally {
+    await browser.close();
+  }
+}
+
+// =========================================================================
+// QUẢN LÝ TOKEN: DÙNG API REFRESH TRƯỚC, LỖI THÌ GỌI PUPPETEER CỨU NGUY
 // =========================================================================
 async function getValidToken(forceRefresh = false) {
   const authData = (await fbGet("worker_auth")) || {};
@@ -83,39 +165,35 @@ async function getValidToken(forceRefresh = false) {
     return authData.access_token;
   }
 
-  const currentRefresh = authData.refresh_token || INITIAL_REFRESH_TOKEN;
-  if (!currentRefresh) {
-    throw new Error("Không tìm thấy refresh_token để gia hạn phiên!");
-  }
-
-  let lastErr = "";
-  for (const url of AUTH_ENDPOINTS) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "apikey": APIKEY,
-        "Origin": "https://play.lazi.vn",
-        "Referer": "https://play.lazi.vn/lobby"
-      },
-      body: JSON.stringify({ refresh_token: currentRefresh })
-    });
-
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.access_token && data.refresh_token) {
-      await fbPatch("worker_auth", {
-        access_token: data.access_token,
-        refresh_token: data.refresh_token,
-        expires_at: Date.now() + (data.expires_in || 3600) * 1000,
-        updated_at: Date.now()
+  if (authData.refresh_token) {
+    for (const url of AUTH_ENDPOINTS) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "apikey": APIKEY,
+          "Origin": "https://play.lazi.vn",
+          "Referer": "https://play.lazi.vn/lobby"
+        },
+        body: JSON.stringify({ refresh_token: authData.refresh_token })
       });
-      await pushLog("INFO", "Đã tự động làm mới cặp access_token & refresh_token.");
-      return data.access_token;
+
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.access_token && data.refresh_token) {
+        await fbPatch("worker_auth", {
+          access_token: data.access_token,
+          refresh_token: data.refresh_token,
+          expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+          updated_at: Date.now()
+        });
+        await pushLog("INFO", "Đã gia hạn nhanh token qua API.");
+        return data.access_token;
+      }
     }
-    lastErr = `(${res.status}) ${JSON.stringify(data)}`;
   }
 
-  throw new Error(`Gia hạn token thất bại: ${lastErr}`);
+  // Nếu refresh_token bị cháy (do ông vừa mở game trên web), tự bật Puppeteer lấy lại!
+  return await fetchTokensViaPuppeteer();
 }
 
 async function rpc(name, body, token) {
@@ -143,16 +221,12 @@ async function rpc(name, body, token) {
   return { status: res.status, data };
 }
 
-// =========================================================================
-// LUỒNG CÂU CÁ THẬT (CAST -> ĐỢI BITE + FIGHT -> LAND)
-// =========================================================================
 async function executeSingleCycle() {
   let token = await getValidToken(false);
   const t0 = Date.now();
 
   let castRes = await rpc("fishing_cast", { p_rod: null }, token);
 
-  // Nếu token vừa hết hạn đột xuất thì ép đổi token mới và thả câu lại ngay
   if (castRes.status === 401 || castRes.status === 403) {
     token = await getValidToken(true);
     castRes = await rpc("fishing_cast", { p_rod: null }, token);
@@ -166,7 +240,6 @@ async function executeSingleCycle() {
   }
 
   const { cast, bite_ms = 2000, fight_ms = 1500, fish_tier } = castRes.data;
-
   await sleep(bite_ms + fight_ms + 250);
 
   const landRes = await rpc("fishing_land", { p_cast: cast, p_ok: true }, token);
@@ -181,16 +254,10 @@ async function executeSingleCycle() {
 
   const d = landRes.data;
   if (d.result !== "caught") {
-    return {
-      ok: false,
-      detail: `Trượt mất rồi (result=${d.result || "unknown"})`
-    };
+    return { ok: false, detail: `Trượt mất rồi (result=${d.result || "unknown"})` };
   }
 
-  const fishName =
-    d.name ||
-    d.fish_name ||
-    `Cá Tier ${fish_tier ?? 1} (Hiếm ${d.rarity ?? 0})`;
+  const fishName = d.name || d.fish_name || `Cá Tier ${fish_tier ?? 1} (Hiếm ${d.rarity ?? 0})`;
 
   return {
     ok: true,
@@ -222,6 +289,15 @@ async function executeSingleCycle() {
   });
 
   await pushLog("INFO", `Khởi động worker #${RUN_ID} (${MAX_HOURS}h) — ${RUN_NOTE}`);
+
+  try {
+    // Luôn khởi động bằng Puppeteer để lấy phiên sạch mới nhất từ cookie
+    await fetchTokensViaPuppeteer();
+  } catch (err) {
+    await pushLog("ERROR", `Lỗi khởi tạo phiên: ${err.message}`);
+    await fbPatch("worker_control", { status: "idle", last_heartbeat: Date.now() });
+    return;
+  }
 
   let loopIndex = 0;
   while (Date.now() < END_TIME) {
@@ -291,12 +367,7 @@ async function executeSingleCycle() {
         last_heartbeat: Date.now(),
         err_count: errCount
       });
-      await pushLog("ERROR", `Lỗi nghiêm trọng: ${err.message}`);
-
-      // Nếu bản thân refresh_token bị thu hồi hoặc hết hạn hẳn thì dừng luôn cho đỡ đốt phút GitHub
-      if (err.message.includes("Gia hạn token thất bại")) {
-        break;
-      }
+      await pushLog("ERROR", `Lỗi ngoại lệ: ${err.message}`);
     }
 
     loopIndex++;
@@ -314,4 +385,4 @@ async function executeSingleCycle() {
   });
   await pushLog("INFO", `Kết thúc phiên chạy. Dính cá: ${okCount} | Hụt/Lỗi: ${errCount}`);
 })();
-      
+  
