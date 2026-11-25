@@ -17,7 +17,8 @@ const MAX_HOURS = Math.max(0.1, Math.min(parseFloat(process.env.RUN_HOURS || "1"
 const DELAY_MS = Math.max(800, parseInt(process.env.DELAY_MS || "1500", 10));
 const RUN_NOTE = process.env.RUN_NOTE || "Treo câu cá tự động";
 const RUN_ID = process.env.GITHUB_RUN_ID || `local-${Date.now()}`;
-const END_TIME = Date.now() + MAX_HOURS * 3600 * 1000;
+const WORKER_STARTED_AT = Date.now();
+const END_TIME = WORKER_STARTED_AT + MAX_HOURS * 3600 * 1000;
 
 // =========================================================================
 // BẢNG GIÁ, CẤP & UUID MẶC ĐỊNH CỦA CẦN CÂU & MỒI CÂU (CẤP 1 -> 6)
@@ -646,6 +647,86 @@ async function pruneOldLogs(keep = 180) {
 }
 
 // =========================================================================
+// ĐỌC TRẠNG THÁI & TÍN HIỆU DỪNG / TẠM DỪNG RIÊNG TỪNG ACC / RUN
+// =========================================================================
+function evaluateWorkerControlSignals(ctrl) {
+  const c = ctrl || {};
+  const accCtrl = c.acc_control?.[ACTIVE_ACC.id] || {};
+  const runCtrl = c.run_control?.[RUN_ID] || {};
+
+  // Chỉ nhận lệnh stop dành riêng cho acc này hoặc run này (tránh kill chéo người khác)
+  const stopTarget = String(c.stop_target || "").trim();
+  const targetedGlobalStop =
+    c.stop === true &&
+    (
+      stopTarget === ACTIVE_ACC.id ||
+      stopTarget === RUN_ID ||
+      (!stopTarget && c.active_account === ACTIVE_ACC.id)
+    );
+
+  const shouldStop = Boolean(accCtrl.stop === true || runCtrl.stop === true || targetedGlobalStop);
+
+  const pauseTarget = String(c.pause_target || "").trim();
+  const targetedGlobalPause =
+    c.paused === true &&
+    (
+      pauseTarget === ACTIVE_ACC.id ||
+      pauseTarget === RUN_ID ||
+      (!pauseTarget && c.active_account === ACTIVE_ACC.id)
+    );
+
+  const shouldPause = Boolean(accCtrl.paused === true || runCtrl.paused === true || targetedGlobalPause);
+
+  return { shouldStop, shouldPause, targetedGlobalStop };
+}
+
+async function updateWorkerRuntimeStatus(ctrl, extra = {}) {
+  const now = Date.now();
+  const statusPayload = {
+    worker_status: extra.status || "running",
+    worker_run_id: RUN_ID,
+    worker_note: RUN_NOTE,
+    last_heartbeat: now,
+    ...extra
+  };
+
+  // Ghi trạng thái riêng từng acc & từng run để không đè lên người khác
+  if (ACTIVE_ACC.id && ACTIVE_ACC.id !== "default") {
+    await fbPatch(`worker_accounts/${ACTIVE_ACC.id}`, statusPayload);
+  }
+  await fbPatch(`worker_control/runs/${RUN_ID}`, {
+    account_id: ACTIVE_ACC.id,
+    account_name: ACTIVE_ACC.label,
+    note: RUN_NOTE,
+    started_at: WORKER_STARTED_AT,
+    ends_at: END_TIME,
+    ...statusPayload
+  });
+
+  // Chỉ cập nhật bảng tổng worker_control nếu dashboard đang chọn đúng acc này hoặc chưa có ai chiếm
+  const c = ctrl || (await fbGet("worker_control")) || {};
+  if (!c.active_account || c.active_account === ACTIVE_ACC.id) {
+    await fbPatch("worker_control", {
+      status: extra.status || "running",
+      run_id: RUN_ID,
+      note: RUN_NOTE,
+      active_account: ACTIVE_ACC.id,
+      active_account_name: ACTIVE_ACC.label,
+      last_heartbeat: now,
+      ...(typeof extra.ok_count === "number" ? { ok_count: extra.ok_count } : {}),
+      ...(typeof extra.err_count === "number" ? { err_count: extra.err_count } : {}),
+      ...(typeof extra.avg_latency === "number" ? { avg_latency: extra.avg_latency } : {}),
+      ...(extra.active_rod_name !== undefined ? { active_rod_name: extra.active_rod_name } : {}),
+      ...(extra.active_rod_durability !== undefined ? { active_rod_durability: extra.active_rod_durability } : {}),
+      ...(extra.active_bait_name !== undefined ? { active_bait_name: extra.active_bait_name } : {}),
+      ...(extra.active_bait_left !== undefined ? { active_bait_left: extra.active_bait_left } : {}),
+      ...(extra.started_at !== undefined ? { started_at: extra.started_at } : {}),
+      ...(extra.ends_at !== undefined ? { ends_at: extra.ends_at } : {})
+    });
+  }
+}
+
+// =========================================================================
 // BỘ PHÂN TÍCH COOKIE ĐA ĐỊNH DẠNG (JSON ARRAY HOẶC HEADER STRING) & NHẬN DIỆN ACC
 // =========================================================================
 function parseSmartCookies(rawInput) {
@@ -778,7 +859,6 @@ async function resolveTargetAccount() {
         }
       };
 
-      // Dọn sẵn các UUID đã gãy trong pool nếu có
       for (const [uuid, reg] of Object.entries(ACTIVE_ACC.rodRegistry)) {
         if (reg && (reg.broken || (typeof reg.durability === "number" && reg.durability <= 0))) {
           markRodBroken(uuid, reg.tier);
@@ -1122,7 +1202,6 @@ async function syncServerInventoryBeforeBuy(token, preferredTier) {
   };
   if (cookieHeader) baseHeaders["Cookie"] = cookieHeader;
 
-  // 1. Thử các RPC đọc state phổ biến
   for (const fn of ["fishing_state", "fishing_get", "get_fishing_state"]) {
     try {
       const r = await rpc(fn, {}, token);
@@ -1136,7 +1215,6 @@ async function syncServerInventoryBeforeBuy(token, preferredTier) {
     } catch {}
   }
 
-  // 2. Thử đọc trực tiếp từ các bảng Supabase REST (RLS chỉ trả về dòng của acc hiện tại)
   for (const tbl of ["fishing_states", "fishing_players", "fishing_profiles"]) {
     try {
       const res = await fetch(`${REST_BASE}/${tbl}?select=*&limit=1`, { headers: baseHeaders });
@@ -1200,7 +1278,6 @@ async function buyItem(item, qty, tag) {
     return { ok: true, free: true };
   }
 
-  // Khóa chống mua trùng liên tiếp trong 5 giây
   const lockKey = `${target.kind}:${target.itemCode}`;
   if (RECENT_PURCHASES[lockKey] && Date.now() - RECENT_PURCHASES[lockKey] < 5000) {
     return { ok: true, skipped: "cooldown" };
@@ -1307,13 +1384,11 @@ async function ensureUsableRodOrBuy(cfg, tag) {
   const target = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
   if (target.kind !== "rod" || target.free) return true;
 
-  // Lớp 1: Kiểm tra kho UUID đã lưu trong bot / Firebase
   const switchedLocal = await switchToAvailableRodInTier(cfg, tag);
   if (switchedLocal) {
     return true;
   }
 
-  // Lớp 2: Kiểm tra lại kho thật trên server (tránh mua trùng khi đã mua thừa từ trước)
   const token = await getValidToken(false);
   const foundOnServer = await syncServerInventoryBeforeBuy(token, target.tier);
   if (foundOnServer) {
@@ -1327,7 +1402,6 @@ async function ensureUsableRodOrBuy(cfg, tag) {
     }
   }
 
-  // Lớp 3: Xác nhận hết sạch cần cấp này -> chỉ mua nếu bật auto_buy_rod
   if (!cfg.auto_buy_rod) {
     return false;
   }
@@ -1430,7 +1504,6 @@ async function executeSingleCycle(cycleNum, cfg) {
   let token = await getValidToken(false);
   const tCycle = Date.now();
 
-  // Trước khi thả câu: luôn đảm bảo đang cầm cây dự phòng còn dùng được (hoặc mua nếu hết sạch)
   await ensureUsableRodOrBuy(cfg, `CHECK-ROD #${cycleNum}`);
   await checkAndBuyBaitIfNeeded(cfg, `PRE-CAST-BAIT #${cycleNum}`);
 
@@ -1453,7 +1526,6 @@ async function executeSingleCycle(cycleNum, cfg) {
   if (typeof castCoins === "number") await syncCoins(castCoins);
   syncRodsFromPayload(castRes.data);
 
-  // Phát hiện trường hợp gửi UUID cần cấp cao nhưng server từ chối và rơi về Cần trúc (tier 1)
   const targetRod = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
   if (
     castRes.status === 200 &&
@@ -1552,7 +1624,6 @@ async function executeSingleCycle(cycleNum, cfg) {
       if (nextRodId) markRodBroken(nextRodId, nextRodTier);
       await syncGearTelemetry();
       await pushLog("WARN", `Vòng #${cycleNum} | ${formatRodLabel(nextRodTier, nextRodId)} đã hết độ bền / gãy (Độ bền: ${durVal ?? 0}%)`);
-      // Kiểm tra lại kho xem còn cây dự phòng nào không; hết sạch mới mua
       await ensureUsableRodOrBuy(cfg, `BROKEN-ROD #${cycleNum}`);
     } else {
       ACTIVE_ACC.rodState = {
@@ -1611,21 +1682,29 @@ async function executeSingleCycle(cycleNum, cfg) {
     initialCookies = await resolveTargetAccount();
   } catch (err) {
     await pushLog("ERROR", `Không nạp được tài khoản: ${err.message}`);
-    await fbPatch("worker_control", { status: "idle", last_heartbeat: Date.now() });
+    await updateWorkerRuntimeStatus(null, { status: "idle" });
     return;
   }
 
-  await fbPatch("worker_control", {
-    status: "running",
+  // Chỉ reset công tắc stop/paused của đúng acc & run hiện tại, không đụng công tắc của người khác
+  await fbPatch(`worker_control/acc_control/${ACTIVE_ACC.id}`, {
     stop: false,
     paused: false,
     run_id: RUN_ID,
-    note: RUN_NOTE,
-    active_account: ACTIVE_ACC.id,
-    active_account_name: ACTIVE_ACC.label,
-    started_at: Date.now(),
+    updated_at: Date.now()
+  });
+  await fbPatch(`worker_control/run_control/${RUN_ID}`, {
+    stop: false,
+    paused: false,
+    account_id: ACTIVE_ACC.id,
+    updated_at: Date.now()
+  });
+
+  const initCtrl = (await fbGet("worker_control")) || {};
+  await updateWorkerRuntimeStatus(initCtrl, {
+    status: "running",
+    started_at: WORKER_STARTED_AT,
     ends_at: END_TIME,
-    last_heartbeat: Date.now(),
     ok_count: 0,
     err_count: 0,
     avg_latency: 0
@@ -1641,21 +1720,27 @@ async function executeSingleCycle(cycleNum, cfg) {
     await fetchTokensViaPuppeteer(initialCookies, autoCfg);
   } catch (err) {
     await pushLog("ERROR", `Dừng worker do lỗi khởi tạo phiên: ${err.message}`);
-    await fbPatch("worker_control", { status: "idle", last_heartbeat: Date.now() });
+    await updateWorkerRuntimeStatus(null, { status: "idle" });
     return;
   }
 
   let loopIndex = 0;
   while (Date.now() < END_TIME) {
     const ctrl = (await fbGet("worker_control")) || {};
+    const signals = evaluateWorkerControlSignals(ctrl);
 
-    if (ctrl.stop === true) {
-      await pushLog("WARN", "Nhận lệnh DỪNG KHẨN CẤP từ bảng điều khiển.");
+    if (signals.shouldStop) {
+      await pushLog("WARN", `Nhận lệnh DỪNG riêng cho ${ACTIVE_ACC.label} (#${RUN_ID}).`);
+      if (signals.targetedGlobalStop) {
+        await fbPatch("worker_control", { stop: false, stop_target: null });
+      }
+      await fbPatch(`worker_control/acc_control/${ACTIVE_ACC.id}`, { stop: false, updated_at: Date.now() });
+      await fbPatch(`worker_control/run_control/${RUN_ID}`, { stop: false, updated_at: Date.now() });
       break;
     }
 
-    if (ctrl.paused === true) {
-      await fbPatch("worker_control", { status: "paused", last_heartbeat: Date.now() });
+    if (signals.shouldPause) {
+      await updateWorkerRuntimeStatus(ctrl, { status: "paused" });
       await sleep(3000);
       continue;
     }
@@ -1691,9 +1776,8 @@ async function executeSingleCycle(cycleNum, cfg) {
         const selRod = getSelectedRodStatus(activeCfg);
         const selBait = getSelectedBaitStatus(activeCfg);
 
-        await fbPatch("worker_control", {
+        await updateWorkerRuntimeStatus(ctrl, {
           status: "running",
-          last_heartbeat: Date.now(),
           ok_count: okCount,
           err_count: errCount,
           avg_latency: avgLat,
@@ -1712,18 +1796,16 @@ async function executeSingleCycle(cycleNum, cfg) {
         await runPeriodicAutomation(activeCfg, okCount);
       } else {
         errCount++;
-        await fbPatch("worker_control", {
+        await updateWorkerRuntimeStatus(ctrl, {
           status: "running",
-          last_heartbeat: Date.now(),
           err_count: errCount
         });
         await pushLog("WARN", result.detail || "Chu kỳ thất bại");
       }
     } catch (err) {
       errCount++;
-      await fbPatch("worker_control", {
+      await updateWorkerRuntimeStatus(ctrl, {
         status: "running",
-        last_heartbeat: Date.now(),
         err_count: errCount
       });
       await pushLog("ERROR", `Vòng #${loopIndex} gặp ngoại lệ: ${err.message}`);
@@ -1740,10 +1822,14 @@ async function executeSingleCycle(cycleNum, cfg) {
     await sellFish(autoCfg.sell_fish, "AUTO-SELL END");
   }
 
-  await fbPatch("worker_control", {
-    status: "idle",
+  await fbPatch(`worker_control/acc_control/${ACTIVE_ACC.id}`, {
     paused: false,
-    last_heartbeat: Date.now()
+    updated_at: Date.now()
   });
+  await fbPatch(`worker_control/run_control/${RUN_ID}`, {
+    paused: false,
+    updated_at: Date.now()
+  });
+  await updateWorkerRuntimeStatus(null, { status: "idle" });
   await pushLog("INFO", `=== KẾT THÚC PHIÊN #${RUN_ID} | Dính cá: ${okCount} | Hụt/Lỗi: ${errCount} ===`);
 })();
