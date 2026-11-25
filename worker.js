@@ -1,8 +1,12 @@
 const DB_URL = process.env.FIREBASE_DB_URL || "https://chat-4e280-default-rtdb.firebaseio.com";
 const DB_SECRET = process.env.FIREBASE_DB_SECRET || "";
-const SECRET_TOKEN = process.env.MY_SECRET_TOKEN || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHRwczovL3BsYXkubGF6aS52bi9hdXRoL3YxIiwic3ViIjoiN2FjNWZlMWEtNDRkMS00MTJjLWFiNjItZGE3NzYyNDBiZTkxIiwiYXVkIjoiYXV0aGVudGljYXRlZCIsImV4cCI6MTc5NTU3OTUxNSwiaWF0IjoxNzk1NTc1OTE1LCJlbWFpbCI6ImxhemktNDI1MzgyMEB1c2Vycy5sYXppLnZuIiwicGhvbmUiOiIiLCJhcHBfbWV0YWRhdGEiOnsibGF6aV91X2lkIjo0MjUzODIwLCJwcm92aWRlciI6ImVtYWlsIiwicHJvdmlkZXJzIjpbImVtYWlsIl19LCJ1c2VyX21ldGFkYXRhIjp7ImF2YXRhcl91cmwiOiJodHRwczovL2Nkbi5sYXppLnZuL3N0b3JhZ2UvdXBsb2Fkcy91c2Vycy9hdmF0YXIvMTc5NDcwNjIyMF9sYXppXzUyNzU0Ny5wbmciLCJkaXNwbGF5X25hbWUiOiJOZ3V54buFbiBUaeG6v24gTmFtIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImxhemlfdXNlcm5hbWUiOiJ0aWVuLW5hbS5uZ3V5ZW4yMCJ9LCJyb2xlIjoiYXV0aGVudGljYXRlZCIsImFhbCI6ImFhbDEiLCJhbXIiOlt7Im1ldGhvZCI6Im90cCIsInRpbWVzdGFtcCI6MTc5NTM1NDY4N31dLCJzZXNzaW9uX2lkIjoiZTgwNDEwZDgtMmI0ZS00OWViLWI4OWMtMmJmZDU3MWRhZGIyIiwiaXNfYW5vbnltb3VzIjpmYWxzZX0.UTBB4X9qfpU4wyVusyaCakXoTF14_9Cs2NDdRO9khmw";
+const INITIAL_REFRESH_TOKEN = process.env.MY_REFRESH_TOKEN || "3z7r7ttgceht";
 
 const BASE = "https://play.lazi.vn/rest/v1/rpc";
+const AUTH_ENDPOINTS = [
+  "https://play.lazi.vn/auth/v1/token?grant_type=refresh_token",
+  "https://vvyohpqnvxxyxygscxsj.supabase.co/auth/v1/token?grant_type=refresh_token"
+];
 const APIKEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzk1MzIxNzY4LCJleHAiOjIxMTA2ODE3Njh9.TFy0zQvn7fXnwbaniwb4yvfBfdLp3SXD59pG6w9QQjg";
 
 const MAX_HOURS = Math.max(0.1, Math.min(parseFloat(process.env.RUN_HOURS || "1"), 5));
@@ -53,7 +57,6 @@ async function pushLog(level, msg, latency = null) {
   await fbPost("worker_logs", entry);
 }
 
-// Giữ tối đa 150 dòng log gần nhất để Firebase luôn nhẹ
 async function pruneOldLogs(keep = 150) {
   const res = await fetch(`${dbEndpoint("worker_logs")}${DB_SECRET ? "&" : "?"}shallow=true`);
   if (!res.ok) return;
@@ -65,7 +68,56 @@ async function pruneOldLogs(keep = 150) {
   await fbPatch("worker_logs", patchObj);
 }
 
-// Gọi RPC của play.lazi.vn
+// =========================================================================
+// TỰ ĐỘNG GIA HẠN & XOAY VÒNG REFRESH TOKEN TRÊN FIREBASE
+// =========================================================================
+async function getValidToken(forceRefresh = false) {
+  const authData = (await fbGet("worker_auth")) || {};
+
+  if (
+    !forceRefresh &&
+    authData.access_token &&
+    authData.expires_at &&
+    Date.now() < authData.expires_at - 180000
+  ) {
+    return authData.access_token;
+  }
+
+  const currentRefresh = authData.refresh_token || INITIAL_REFRESH_TOKEN;
+  if (!currentRefresh) {
+    throw new Error("Không tìm thấy refresh_token để gia hạn phiên!");
+  }
+
+  let lastErr = "";
+  for (const url of AUTH_ENDPOINTS) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "apikey": APIKEY,
+        "Origin": "https://play.lazi.vn",
+        "Referer": "https://play.lazi.vn/lobby"
+      },
+      body: JSON.stringify({ refresh_token: currentRefresh })
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.access_token && data.refresh_token) {
+      await fbPatch("worker_auth", {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+        updated_at: Date.now()
+      });
+      await pushLog("INFO", "Đã tự động làm mới cặp access_token & refresh_token.");
+      return data.access_token;
+    }
+    lastErr = `(${res.status}) ${JSON.stringify(data)}`;
+  }
+
+  throw new Error(`Gia hạn token thất bại: ${lastErr}`);
+}
+
 async function rpc(name, body, token) {
   const res = await fetch(`${BASE}/${name}`, {
     method: "POST",
@@ -94,22 +146,16 @@ async function rpc(name, body, token) {
 // =========================================================================
 // LUỒNG CÂU CÁ THẬT (CAST -> ĐỢI BITE + FIGHT -> LAND)
 // =========================================================================
-async function executeSingleCycle(token) {
-  if (!token) {
-    return { ok: false, fatal: true, detail: "Chưa có token!" };
-  }
-
+async function executeSingleCycle() {
+  let token = await getValidToken(false);
   const t0 = Date.now();
 
-  // Bước 1: Thả câu
-  const castRes = await rpc("fishing_cast", { p_rod: null }, token);
+  let castRes = await rpc("fishing_cast", { p_rod: null }, token);
 
+  // Nếu token vừa hết hạn đột xuất thì ép đổi token mới và thả câu lại ngay
   if (castRes.status === 401 || castRes.status === 403) {
-    return {
-      ok: false,
-      fatal: true,
-      detail: `Token hết hạn hoặc bị từ chối (${castRes.status}). Lấy token mới đè vào nhé!`
-    };
+    token = await getValidToken(true);
+    castRes = await rpc("fishing_cast", { p_rod: null }, token);
   }
 
   if (castRes.status !== 200 || !castRes.data?.cast) {
@@ -121,20 +167,10 @@ async function executeSingleCycle(token) {
 
   const { cast, bite_ms = 2000, fight_ms = 1500, fish_tier } = castRes.data;
 
-  // Bước 2: Chờ cá cắn câu & giằng co
   await sleep(bite_ms + fight_ms + 250);
 
-  // Bước 3: Kéo cá
   const landRes = await rpc("fishing_land", { p_cast: cast, p_ok: true }, token);
   const latency = Date.now() - t0;
-
-  if (landRes.status === 401 || landRes.status === 403) {
-    return {
-      ok: false,
-      fatal: true,
-      detail: `Token hết hạn lúc kéo cá (${landRes.status}).`
-    };
-  }
 
   if (landRes.status !== 200 || !landRes.data) {
     return {
@@ -144,7 +180,6 @@ async function executeSingleCycle(token) {
   }
 
   const d = landRes.data;
-
   if (d.result !== "caught") {
     return {
       ok: false,
@@ -204,7 +239,7 @@ async function executeSingleCycle(token) {
     }
 
     try {
-      const result = await executeSingleCycle(SECRET_TOKEN);
+      const result = await executeSingleCycle();
 
       if (result.ok) {
         okCount++;
@@ -247,11 +282,6 @@ async function executeSingleCycle(token) {
           last_heartbeat: Date.now(),
           err_count: errCount
         });
-
-        if (result.fatal) {
-          await pushLog("ERROR", result.detail);
-          break;
-        }
         await pushLog("WARN", result.detail || "Chu kỳ thất bại");
       }
     } catch (err) {
@@ -261,7 +291,12 @@ async function executeSingleCycle(token) {
         last_heartbeat: Date.now(),
         err_count: errCount
       });
-      await pushLog("ERROR", `Lỗi ngoại lệ: ${err.message}`);
+      await pushLog("ERROR", `Lỗi nghiêm trọng: ${err.message}`);
+
+      // Nếu bản thân refresh_token bị thu hồi hoặc hết hạn hẳn thì dừng luôn cho đỡ đốt phút GitHub
+      if (err.message.includes("Gia hạn token thất bại")) {
+        break;
+      }
     }
 
     loopIndex++;
@@ -279,4 +314,4 @@ async function executeSingleCycle(token) {
   });
   await pushLog("INFO", `Kết thúc phiên chạy. Dính cá: ${okCount} | Hụt/Lỗi: ${errCount}`);
 })();
-  
+      
