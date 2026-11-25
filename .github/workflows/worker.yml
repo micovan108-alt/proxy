@@ -1,0 +1,41 @@
+name: Personal Task Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Số giờ chạy (tối đa 5)'
+        required: true
+        default: '2'
+      delay_ms:
+        description: 'Thời gian nghỉ giữa các vòng (ms)'
+        required: true
+        default: '1500'
+      note:
+        description: 'Ghi chú phiên chạy'
+        required: false
+        default: 'Phiên chạy tự động'
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 310 # Trần cứng 5h10p để không đụng giới hạn 6h của GitHub
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Worker
+        env:
+          MY_SECRET_TOKEN: ${{ secrets.MY_SECRET_TOKEN }}
+          FIREBASE_DB_SECRET: ${{ secrets.FIREBASE_DB_SECRET }}
+          FIREBASE_DB_URL: "https://chat-4e280-default-rtdb.firebaseio.com"
+          RUN_HOURS: ${{ github.event.inputs.hours }}
+          DELAY_MS: ${{ github.event.inputs.delay_ms }}
+          RUN_NOTE: ${{ github.event.inputs.note }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: node worker.js
