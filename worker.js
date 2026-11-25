@@ -17,6 +17,79 @@ const RUN_NOTE = process.env.RUN_NOTE || "Treo câu cá tự động";
 const RUN_ID = process.env.GITHUB_RUN_ID || `local-${Date.now()}`;
 const END_TIME = Date.now() + MAX_HOURS * 3600 * 1000;
 
+const FISH_DICT = {
+  ro_dong: "Cá rô đồng",
+  diec: "Cá diếc",
+  muong: "Cá mương",
+  tre: "Cá trê",
+  ro_phi: "Cá rô phi",
+  bong: "Cá bống",
+  sac: "Cá sặc",
+  vang: "Cá vàng",
+  chach: "Cá chạch",
+  bay_mau: "Cá bảy màu",
+  thia: "Cá xiêm",
+  ro_hoang_kim: "Cá rô hoàng kim",
+  tre_bach_tang: "Cá trê bạch tạng",
+  chep: "Cá chép",
+  tram_co: "Cá trắm cỏ",
+  me_trang: "Cá mè trắng",
+  loc: "Cá lóc",
+  tra: "Cá tra",
+  basa: "Cá ba sa",
+  chim_trang: "Cá chim trắng",
+  he_do: "Cá he đỏ",
+  thac_lac: "Cá thát lát còm",
+  koi: "Cá Koi",
+  bong_tuong: "Cá bống tượng",
+  chep_vu_mon: "Cá chép vượt Vũ Môn",
+  tram_den: "Cá trắm đen",
+  tai_tuong: "Cá tai tượng",
+  lang: "Cá lăng",
+  hoi: "Cá hồi",
+  hoi_van: "Cá hồi vân",
+  chien: "Cá chiên",
+  chem: "Cá chẽm",
+  chinh: "Cá chình",
+  tam: "Cá tầm",
+  ngan_long: "Cá ngân long",
+  huyet_long: "Cá huyết long",
+  ca_ho: "Cá hô khổng lồ",
+  thu: "Cá thu",
+  mu: "Cá mú",
+  hong: "Cá hồng",
+  bop: "Cá bớp",
+  noc: "Cá nóc",
+  vet: "Cá vẹt",
+  nhong: "Cá nhồng",
+  napoleon: "Cá Napoleon",
+  duoi: "Cá đuối bồng",
+  mu_nghe: "Cá mú nghệ",
+  vua_ran_san_ho: "Vua rạn san hô",
+  ngu_soc: "Cá ngừ sọc dưa",
+  ngu_vay_vang: "Cá ngừ vây vàng",
+  dorado: "Cá nục heo cờ",
+  map_xanh: "Cá mập xanh",
+  co: "Cá cờ",
+  kiem: "Cá kiếm",
+  map_bua: "Cá mập đầu búa",
+  manta: "Cá đuối manta",
+  mat_trang: "Cá mặt trăng",
+  ngu_vay_xanh: "Cá ngừ vây xanh",
+  marlin: "Cá cờ xanh",
+  map_trang: "Cá mập trắng",
+  long_den: "Cá lồng đèn",
+  chinh_tui: "Cá chình túi",
+  mai_cheo: "Cá mái chèo",
+  vay_tay: "Cá vây tay",
+  map_voi: "Cá mập voi",
+  hac_long: "Hắc long vực thẳm",
+  phuong_hoang: "Cá phượng hoàng",
+  thuy_quai_bang: "Thuỷ quái băng giá",
+  kim_long: "Kim long",
+  ky_lan_bien: "Kỳ lân biển"
+};
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // =========================================================================
@@ -113,7 +186,6 @@ async function fetchTokensViaPuppeteer() {
   try {
     const page = await browser.newPage();
 
-    // Ẩn dấu vết webdriver & dùng đúng User-Agent Chrome Linux khớp với engine
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
@@ -124,7 +196,6 @@ async function fetchTokensViaPuppeteer() {
       "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     });
 
-    // Chỉ chặn ảnh/font/media để nhẹ RAM, giữ nguyên CSS & JS để SPA không bị treo
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       if (["image", "font", "media"].includes(req.resourceType())) {
@@ -134,7 +205,6 @@ async function fetchTokensViaPuppeteer() {
       }
     });
 
-    // Lớp 1: Nghe lén trực tiếp response API nhả access_token & refresh_token
     let interceptedSession = null;
     page.on("response", async (res) => {
       try {
@@ -156,7 +226,6 @@ async function fetchTokensViaPuppeteer() {
       } catch {}
     });
 
-    // Parse & nạp cookie vào cả domain gốc .lazi.vn
     const rawPairs = LAZI_COOKIE.split(";").map((p) => p.trim()).filter(Boolean);
     const cookies = [];
     for (const pair of rawPairs) {
@@ -176,11 +245,10 @@ async function fetchTokensViaPuppeteer() {
     await page.setCookie(...cookies);
     await pushLog("INFO", `[SSO 2/5] Đã nạp ${cookies.length} cookie vào trình duyệt ảo.`);
 
-    // Bước đệm: Vào trang chủ lazi.vn để kích hoạt & xác minh cookie gốc còn sống
     const resMain = await page.goto("https://lazi.vn/", {
       waitUntil: "domcontentloaded",
       timeout: 30000
-    });
+    }).catch(() => null);
     const mainStatus = resMain ? resMain.status() : "N/A";
     const isLoggedInLazi = await page.evaluate(() => {
       const html = document.body ? document.body.innerHTML : "";
@@ -191,7 +259,6 @@ async function fetchTokensViaPuppeteer() {
       `[SSO 3/5] Mở lazi.vn (HTTP ${mainStatus}) | Nhận diện đăng nhập gốc: ${isLoggedInLazi ? "CÓ" : "KHÔNG THẤY"}`
     );
 
-    // Bước chính: Vào sảnh game play.lazi.vn/lobby để kích hoạt cầu nối SSO sang Supabase
     const resLobby = await page.goto("https://play.lazi.vn/lobby", {
       waitUntil: "networkidle2",
       timeout: 45000
@@ -202,7 +269,6 @@ async function fetchTokensViaPuppeteer() {
       `[SSO 4/5] Mở play.lazi.vn/lobby (HTTP ${lobbyStatus}) -> URL hiện tại: ${page.url()}`
     );
 
-    // Chờ tối đa 20 giây cho tới khi bắt được token từ Network hoặc Storage
     let session = null;
     for (let i = 1; i <= 20; i++) {
       if (interceptedSession) {
@@ -254,7 +320,6 @@ async function fetchTokensViaPuppeteer() {
       );
     }
 
-    // Lưu cặp token mới lên Firebase để xoay vòng
     await fbPatch("worker_auth", {
       access_token: session.access_token,
       refresh_token: session.refresh_token,
@@ -401,7 +466,12 @@ async function executeSingleCycle(cycleNum) {
     };
   }
 
-  const fishName = d.name || d.fish_name || `Cá Tier ${fish_tier ?? 1} (Hiếm ${d.rarity ?? 0})`;
+  const fishId = String(d.fish_id || "").toLowerCase().trim();
+  const fishName =
+    FISH_DICT[fishId] ||
+    (fishId ? `Cá ${fishId.replace(/_/g, " ")}` : `Cá Tier ${fish_tier ?? 1} (Hiếm ${d.rarity ?? 0})`);
+
+  const newTag = d.new ? " [MỚI!]" : "";
 
   return {
     ok: true,
@@ -409,7 +479,7 @@ async function executeSingleCycle(cycleNum) {
     value: Number(d.value || 0),
     points: Number(d.points || 0),
     latency: totalLatency,
-    detail: `#${cycleNum} | ${d.size ?? "?"}m - ${d.weight ?? "?"}kg | Túi: ${d.count ?? "?"} | Điểm tổng: ${d.score ?? "?"} | Cast:${castRes.ms}ms + Chờ:${waitTotal}ms + Land:${landRes.ms}ms`
+    detail: `#${cycleNum}${newTag} | ${d.size ?? "?"}m - ${d.weight ?? "?"}kg | Túi: ${d.count ?? "?"} | Điểm tổng: ${d.score ?? "?"} | Cast:${castRes.ms}ms + Chờ:${waitTotal}ms + Land:${landRes.ms}ms`
   };
 }
 
@@ -531,4 +601,3 @@ async function executeSingleCycle(cycleNum) {
   });
   await pushLog("INFO", `=== KẾT THÚC PHIÊN #${RUN_ID} | Dính cá: ${okCount} | Hụt/Lỗi: ${errCount} ===`);
 })();
-                
