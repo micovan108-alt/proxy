@@ -15,6 +15,7 @@ const APIKEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI
 
 const MAX_HOURS = Math.max(0.1, Math.min(parseFloat(process.env.RUN_HOURS || "1"), 5));
 const DELAY_MS = Math.max(800, parseInt(process.env.DELAY_MS || "1500", 10));
+const ONLINE_PING_MS = Math.max(15000, parseInt(process.env.ONLINE_PING_MS || "30000", 10));
 const RUN_NOTE = process.env.RUN_NOTE || "Treo câu cá tự động";
 const RUN_ID = process.env.GITHUB_RUN_ID || `local-${Date.now()}`;
 const WORKER_STARTED_AT = Date.now();
@@ -268,6 +269,8 @@ let ACTIVE_ACC = {
   }
 };
 
+let lastOnlinePingAt = 0;
+
 function isRodUsable(uuid) {
   if (!uuid) return false;
   if (uuid === "starter") return true;
@@ -330,7 +333,6 @@ function recordRodInfo(uuid, tier = null, durability = null, broken = null) {
   }
 }
 
-// Đồng bộ toàn bộ mảng rods & rod từ phản hồi server
 function syncRodsFromPayload(payload, preferredTier = null) {
   if (!payload || typeof payload !== "object") return null;
 
@@ -441,7 +443,6 @@ function getSelectedRodUuid(cfg) {
   return usableList.length > 0 ? usableList[0] : null;
 }
 
-// Chuyển sang cây cần dự phòng cùng cấp nếu còn trong kho, trả về true nếu đã tìm thấy cây dùng được
 async function switchToAvailableRodInTier(cfg, tag = null) {
   const target = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
   if (target.kind !== "rod") return false;
@@ -654,7 +655,6 @@ function evaluateWorkerControlSignals(ctrl) {
   const accCtrl = c.acc_control?.[ACTIVE_ACC.id] || {};
   const runCtrl = c.run_control?.[RUN_ID] || {};
 
-  // Chỉ nhận lệnh stop dành riêng cho acc này hoặc run này (tránh kill chéo người khác)
   const stopTarget = String(c.stop_target || "").trim();
   const targetedGlobalStop =
     c.stop === true &&
@@ -690,7 +690,6 @@ async function updateWorkerRuntimeStatus(ctrl, extra = {}) {
     ...extra
   };
 
-  // Ghi trạng thái riêng từng acc & từng run để không đè lên người khác
   if (ACTIVE_ACC.id && ACTIVE_ACC.id !== "default") {
     await fbPatch(`worker_accounts/${ACTIVE_ACC.id}`, statusPayload);
   }
@@ -703,7 +702,6 @@ async function updateWorkerRuntimeStatus(ctrl, extra = {}) {
     ...statusPayload
   });
 
-  // Chỉ cập nhật bảng tổng worker_control nếu dashboard đang chọn đúng acc này hoặc chưa có ai chiếm
   const c = ctrl || (await fbGet("worker_control")) || {};
   if (!c.active_account || c.active_account === ACTIVE_ACC.id) {
     await fbPatch("worker_control", {
@@ -903,7 +901,50 @@ async function resolveTargetAccount() {
 }
 
 // =========================================================================
-// PUPPETEER SSO EXTRACTOR + ĐỌC/ĐỒNG BỘ CẦN & MỒI TRONG LOCALSTORAGE
+// PING ONLINE THUẦN BẰNG FETCH (KHÔNG CẦN TREO TRÌNH DUYỆT)
+// =========================================================================
+async function sendOnsitePing(token = null, force = false) {
+  const now = Date.now();
+  if (!force && now - lastOnlinePingAt < ONLINE_PING_MS) {
+    return false;
+  }
+  lastOnlinePingAt = now;
+
+  try {
+    const authToken = token || (await fbGet(`worker_auth/${ACTIVE_ACC.id}`))?.access_token;
+    if (!authToken) return false;
+    const cookieHeader = buildCookieHeader(ACTIVE_ACC.rawCookie);
+    const headers = {
+      "Content-Type": "application/json",
+      "Content-Profile": "public",
+      "apikey": APIKEY,
+      "Authorization": `Bearer ${authToken}`,
+      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0",
+      "Referer": "https://play.lazi.vn/lobby",
+      "Origin": "https://play.lazi.vn"
+    };
+    if (cookieHeader) headers["Cookie"] = cookieHeader;
+
+    const res = await fetch(`${BASE}/onsite_ping`, {
+      method: "POST",
+      headers,
+      body: "{}"
+    });
+    return res.status >= 200 && res.status < 300;
+  } catch {
+    return false;
+  }
+}
+
+async function pingOnlineTick(token, cycleNum) {
+  const pinged = await sendOnsitePing(token, false);
+  if (pinged && cycleNum % 15 === 0) {
+    await pushLog("INFO", `[ONLINE] Đã gửi onsite_ping (không treo trình duyệt).`);
+  }
+}
+
+// =========================================================================
+// PUPPETEER SSO EXTRACTOR (LẤY TOKEN XONG ĐÓNG TRÌNH DUYỆT NGAY)
 // =========================================================================
 async function fetchTokensViaPuppeteer(preloadedCookies = null, desiredCfg = null) {
   const cookies = preloadedCookies || (await resolveTargetAccount());
@@ -919,7 +960,7 @@ async function fetchTokensViaPuppeteer(preloadedCookies = null, desiredCfg = nul
   const tStart = Date.now();
   await pushLog(
     "INFO",
-    `[SSO 1/5] Khởi chạy Chromium | Nhận diện acc: ${meta.fullName || "?"} (@${meta.username || "?"} | ID: ${meta.uid || "?"}) — ${cookies.length} cookie`
+    `[SSO 1/5] Khởi chạy Chromium lấy token (xong sẽ đóng ngay) | Acc: ${meta.fullName || "?"} (@${meta.username || "?"} | ID: ${meta.uid || "?"}) — ${cookies.length} cookie`
   );
 
   const browser = await puppeteer.launch({
@@ -1090,10 +1131,11 @@ async function fetchTokensViaPuppeteer(preloadedCookies = null, desiredCfg = nul
     });
 
     await syncGearTelemetry();
+    await sendOnsitePing(session.access_token, true);
 
     await pushLog(
       "INFO",
-      `[SSO 5/5] Bắt thành công token từ ${session.source} | Cần:${formatRodLabel(ACTIVE_ACC.rodState.tier, fishingLocal.rodId)} | Mồi:${formatBaitLabel(ACTIVE_ACC.baitState.tier)}`,
+      `[SSO 5/5] Bắt thành công token từ ${session.source} & đóng trình duyệt | Cần:${formatRodLabel(ACTIVE_ACC.rodState.tier, fishingLocal.rodId)} | Mồi:${formatBaitLabel(ACTIVE_ACC.baitState.tier)}`,
       Date.now() - tStart
     );
 
@@ -1189,7 +1231,6 @@ async function rpc(name, body, token) {
   return { status: res.status, data, ms: Date.now() - t0 };
 }
 
-// Dò kho cần thật trên server (phòng trường hợp đã mua thừa hoặc mua tay trên web)
 async function syncServerInventoryBeforeBuy(token, preferredTier) {
   const cookieHeader = buildCookieHeader(ACTIVE_ACC.rawCookie);
   const baseHeaders = {
@@ -1375,10 +1416,6 @@ async function sellFish(pFish, tag) {
   return { ok, ...res };
 }
 
-// Kiểm tra 3 lớp khi cần hết độ bền / chưa có cần cầm:
-// 1) Tìm trong pool UUID đã lưu -> nếu còn thì đổi sang cầm luôn (không mua)
-// 2) Quét kho trên server -> nếu có cây mua thừa/mua tay chưa đồng bộ thì lấy ra dùng luôn (không mua)
-// 3) Chỉ khi hết sạch cả 2 nơi và bật auto_buy_rod mới bấm mua
 async function ensureUsableRodOrBuy(cfg, tag) {
   if (!cfg.rod_item) return false;
   const target = resolvePurchaseTarget(cfg.rod_item, cfg.rod_qty);
@@ -1686,7 +1723,6 @@ async function executeSingleCycle(cycleNum, cfg) {
     return;
   }
 
-  // Chỉ reset công tắc stop/paused của đúng acc & run hiện tại, không đụng công tắc của người khác
   await fbPatch(`worker_control/acc_control/${ACTIVE_ACC.id}`, {
     stop: false,
     paused: false,
@@ -1740,6 +1776,8 @@ async function executeSingleCycle(cycleNum, cfg) {
     }
 
     if (signals.shouldPause) {
+      const pauseToken = await getValidToken(false).catch(() => null);
+      await pingOnlineTick(pauseToken, loopIndex);
       await updateWorkerRuntimeStatus(ctrl, { status: "paused" });
       await sleep(3000);
       continue;
@@ -1749,6 +1787,9 @@ async function executeSingleCycle(cycleNum, cfg) {
 
     loopIndex++;
     try {
+      const curToken = await getValidToken(false);
+      await pingOnlineTick(curToken, loopIndex);
+
       const result = await executeSingleCycle(loopIndex, activeCfg);
 
       if (result.ok) {
